@@ -842,7 +842,12 @@ module top (
             rd_rescue <= 1'b0;
 
             if (vblank_rise) begin
-                if (slot_ready_m && !primed_m) begin
+                // A reader that is not primed shows the pattern; one that is
+                // primed but has an empty buffer is *starving*, and shows the
+                // last pixel it managed to hand out -- a flat colour.  Both are
+                // the same fault seen from two sides and both get the same
+                // answer: it is not going to recover on its own.
+                if (slot_ready_m && (!primed_m || (rd_used == 9'd0))) begin
                     if (fail_frames == 2'd3) begin
                         if (!fail_latch) begin
                             // what the reader was doing when it gave up: this

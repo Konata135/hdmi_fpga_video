@@ -84,8 +84,20 @@ module tb_frame_rd;
     wire [15:0] pix_underrun;
 
     integer errors = 0, i, r, c, w, k;
+    // how often the reader asked the pixel side for a drain: a request that is
+    // never answered has to be asked again, so this is the counter the resend
+    // test watches
+    integer resync_toggles = 0;
+    reg     rs_q = 1'b0;
     integer count_fetched_before, errors_before;
     integer clean_before, shown_before;
+
+    always @(posedge clk) begin
+        if (!rst && (dut.resync !== rs_q)) begin
+            resync_toggles = resync_toggles + 1;
+            rs_q           = dut.resync;
+        end
+    end
     integer base_a, base_b;
 
     // display frame accounting, and the checks that go with it
@@ -554,7 +566,40 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         if (errors == errors_before)
             $display("  idle         : PASS (no fetching while the frame is unused)");
 
-        // ---- 6. the memory model saw nothing illegal -----------------------
+        // ---- 6. a drain that nobody answers is asked again ----------------
+        // The memory side waits in M_FLUSH for the pixel side's
+        // acknowledgement.  If that never comes it must not wait for ever: the
+        // request is re-issued every couple of milliseconds.  Holding the pixel
+        // side in reset is the only way to create that case here -- the real one
+        // always answers, which is why the board failure it protects against was
+        // so hard to catch.
+        errors_before = errors;
+        loaded        = 1'b0;
+        repeat (200) @(posedge clk);
+        base_word = base_b;
+        loaded    = 1'b1;
+        @(posedge clk);
+        pix_rst   = 1'b1;                   // this side will not answer
+        resync_toggles = 0;
+        repeat (25000) @(posedge clk);      // 0.4 ms: see it waiting
+        if (resync_toggles != 1) begin
+            $display("  FAIL: expected exactly one drain request, saw %0d", resync_toggles);
+            errors = errors + 1;
+        end
+        repeat (300000) @(posedge clk);     // 4.8 ms: two timeouts due
+        if (resync_toggles < 2) begin
+            $display("  FAIL: an unanswered drain request was not re-issued (%0d requests)",
+                     resync_toggles);
+            errors = errors + 1;
+        end else begin
+            $display("  resend       : PASS (%0d drain requests while nothing answered)",
+                     resync_toggles);
+        end
+        pix_rst = 1'b0;
+        loaded  = 1'b0;
+        repeat (200) @(posedge clk);
+
+        // ---- 7. the memory model saw nothing illegal -----------------------
         if (u_ctrl.u_sdram.errors !== 0) begin
             $display("  FAIL: the SDRAM model reported %0d protocol violations",
                      u_ctrl.u_sdram.errors);

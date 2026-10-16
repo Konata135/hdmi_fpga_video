@@ -149,6 +149,7 @@ module mm_frame_rd #(
     reg  [8:0]  br_left;            // words still to arrive from the burst
     reg         resync;             // tells the pixel side to realign
     reg         ack_ref;            // flush_done as it was when the switch began
+    reg  [16:0] flush_wait;         // how long the drain has been outstanding
     reg         fd_s1, fd_s2;
     reg         rr_s1, rr_s2;
     wire        restart_pulse = rr_s2 ^ rr_s1;
@@ -230,6 +231,7 @@ module mm_frame_rd #(
             br_left       <= 9'd0;
             resync        <= 1'b0;
             ack_ref       <= 1'b0;
+            flush_wait    <= 17'd0;
             words_fetched <= 32'd0;
             rows_seen     <= 16'd0;
             fifo_winc     <= 1'b0;
@@ -264,9 +266,12 @@ module mm_frame_rd #(
                 // refilling -- the screen drops back to the pattern and stays
                 // there.  Re-pointing the walk is all a second arm needs to do;
                 // the drain already in flight throws the old bytes away anyway.
-                resync  <= ~resync;
-                ack_ref <= flush_done_s;
-                mstate  <= M_FLUSH;
+                if (mstate != M_FLUSH) begin
+                    resync  <= ~resync;
+                    ack_ref <= flush_done_s;     // the drain we are about to ask for
+                    mstate  <= M_FLUSH;
+                end
+                flush_wait <= 17'd0;
             end else case (mstate)
                 M_IDLE: begin
                     // the burst port wants the request in a ready cycle, one
@@ -327,8 +332,22 @@ module mm_frame_rd #(
                 // before the drain is finished would have the drain eat the
                 // first words of the new picture).
                 default: begin
-                    if (flush_done_s != ack_ref)
+                    // A drain is over in microseconds, so an acknowledgement
+                    // that has not come after a couple of milliseconds was not
+                    // sent (a handshake request that is dropped leaves this side
+                    // waiting for ever -- the same lesson the burst port taught)
+                    // and it has to be asked for again.  Re-issuing it is
+                    // harmless: `resync` is a toggle and the pixel side is
+                    // idempotent about a drain it is already doing.
+                    if (flush_done_s != ack_ref) begin
                         mstate <= M_IDLE;
+                    end else if (flush_wait == 17'h1FFFF) begin
+                        resync     <= ~resync;
+                        ack_ref    <= flush_done_s;
+                        flush_wait <= 17'd0;
+                    end else begin
+                        flush_wait <= flush_wait + 17'd1;
+                    end
                 end
             endcase
         end

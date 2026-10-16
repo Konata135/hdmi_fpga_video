@@ -53,6 +53,7 @@ module tb_pic_sched;
     integer toggles   = 0;
     integer asks [0:15];
     integer ld_left;
+    reg       tried_1 = 1'b0;       // slot 1's transient failure, used once
     reg [2:0] ld_slot;
     reg       tg_q = 1'b0;
     integer   k;
@@ -99,12 +100,21 @@ module tb_pic_sched;
                 ld_slot    <= load_slot;
                 ld_left    <= LD_CYCLES;
                 load_busy  <= 1'b1;
-                load_phase <= 4'd2;             // reading
+                // `phase` is deliberately *not* cleared here.  The real loader
+                // holds its old value -- including the failure flag -- until the
+                // attempt has got far enough to set a new one, and the
+                // scheduler has to cope with that: testing the flag on its own
+                // calls every retry a failure the cycle it starts.
             end else if (load_busy) begin
                 if (ld_left == 0) begin
                     load_busy <= 1'b0;
-                    if (ld_slot == 3'd1) begin
-                        load_phase <= 4'hF;     // this picture never loads
+                    // Slot 1 fails once and then works -- a transient read
+                    // error, which the retry has to actually retry -- and slot
+                    // 2 never works, which the scheduler has to give up on
+                    // after its tries without taking the rest down with it.
+                    if ((ld_slot == 3'd2) || ((ld_slot == 3'd1) && !tried_1)) begin
+                        if (ld_slot == 3'd1) tried_1 = 1'b1;
+                        load_phase <= 4'hF;
                     end else begin
                         load_phase <= 4'h3;     // done
                         load_done  <= 1'b1;
@@ -160,16 +170,20 @@ module tb_pic_sched;
         // ---- 2. in order, one at a time ---------------------------------
         scan_parked = 1'b1;
         k = 0;
-        while ((loaded_count < 2) && (k < 5000)) begin
+        // Wait for the whole sequence, not for "two are in": the last slot is
+        // still being tried (and given up on) after the second one has loaded.
+        // state 5 is S_DONE, "nothing left to load".
+        while ((state_dbg !== 4'd5) && (k < 20000)) begin
             @(posedge clk);
             k = k + 1;
         end
-        if (k >= 5000) begin
-            fail("the two good pictures never both loaded");
+        if (k >= 20000) begin
+            fail("the scheduler never finished walking the table");
         end else begin
-            $display("  order        : asks %0d %0d %0d %0d, %0d loaded",
-                     asks[0], asks[1], asks[2], asks[3], loaded_count);
-            if (asks[0] !== 0 || asks[1] !== 1 || asks[2] !== 1 || asks[3] !== 2)
+            $display("  order        : asks %0d %0d %0d %0d %0d, %0d loaded",
+                     asks[0], asks[1], asks[2], asks[3], asks[4], loaded_count);
+            if (asks[0] !== 0 || asks[1] !== 1 || asks[2] !== 1 ||
+                asks[3] !== 2 || asks[4] !== 2)
                 fail("the slots were not loaded in order, with the failure retried");
             else if (overlap != 0)
                 fail("the loader was asked again while it was still running");
@@ -178,7 +192,7 @@ module tb_pic_sched;
             else if (disp_sel !== 3'd0)
                 fail("the screen did not come up on the first picture");
             else
-                $display("  load order   : PASS (0, 1, 1 retry, 2; slot 1 given up on)");
+                $display("  load order   : PASS (0, then 1 twice -- the retry loaded it -- then 2 twice, given up on)");
         end
 
         // ---- 3. the first picture is announced, and announced once ------
@@ -202,11 +216,11 @@ module tb_pic_sched;
             $display("  step toggle  : PASS (one toggle per change)");
 
         // ---- 5. the key walks the loaded set and wraps ------------------
-        // loaded set is {0, 2}: from 0 the next is 2, and from 2 it wraps to 0
-        if (disp_sel !== 3'd2)
+        // loaded set is {0, 1}: from 0 the next is 1, and from 1 it wraps to 0
+        if (disp_sel !== 3'd1)
             fail("the key did not step on to the next loaded picture");
         else
-            $display("  key step     : PASS (0 -> 2, skipping the picture that never loaded)");
+            $display("  key step     : PASS (0 -> 1)");
         press_key;
         if (disp_sel !== 3'd0)
             fail("the walk did not wrap round to the first loaded picture");

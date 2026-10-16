@@ -76,6 +76,7 @@ module mm_pic_sched #(
     reg  [2:0]  slot;                   // the slot being fetched
     reg  [1:0]  tries;
     reg  [20:0] retry_cnt;
+    reg  [20:0] begun_cnt;              // how long a start has gone unanswered
     reg  [26:0] carou_cnt;
 
     assign state_dbg = {1'b0, state};
@@ -121,6 +122,7 @@ module mm_pic_sched #(
             slot       <= 3'd0;
             tries      <= 2'd0;
             retry_cnt  <= 21'd0;
+            begun_cnt  <= 21'd0;
             tbl_index  <= 3'd0;
             load_start <= 1'b0;
             load_slot  <= 3'd0;
@@ -158,14 +160,33 @@ module mm_pic_sched #(
                 // until it has picked this one up, so the failure test below is
                 // only meaningful once it is running: wait for it to be busy.
                 S_BEG: begin
-                    if (load_busy) state <= S_LOAD;
+                    // The loader takes a start on the next clock, so this must
+                    // not be a bare wait: if it never reports busy, ask again
+                    // rather than waiting for ever (the same "resend until it is
+                    // accepted" rule the burst port taught).
+                    if (load_busy) begin
+                        state     <= S_LOAD;
+                        begun_cnt <= 21'd0;
+                    end else if (begun_cnt == 21'd65535) begin
+                        state     <= S_REQ;
+                        begun_cnt <= 21'd0;
+                    end else begin
+                        begun_cnt <= begun_cnt + 21'd1;
+                    end
                 end
 
                 S_LOAD: begin
                     if (load_done) begin
                         loaded[slot] <= 1'b1;
                         state        <= S_IDLE;
-                    end else if (load_phase == 4'hF) begin
+                    end else if ((load_phase == 4'hF) && !load_busy) begin
+                        // The loader's phase stays "failed" until the *next*
+                        // attempt has taken it away from that state, so testing
+                        // the phase on its own would call every retry a failure
+                        // the moment it started: the tries would be burnt
+                        // instantly, slots would be given up on and the loading
+                        // sequence would drift.  A failure is the phase *plus*
+                        // the loader having stopped.
                         // it gave up: try again in a second, and if it keeps
                         // giving up, leave it out and carry on with the rest
                         if (tries == TRIES_MAX) begin
