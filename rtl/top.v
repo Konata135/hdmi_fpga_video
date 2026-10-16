@@ -544,7 +544,15 @@ module top (
         .words_written  ()
     );
 
-    mm_frame_rd u_frame_rd (
+    // The word buffer must hold more than one picture line: a line is 480 words
+    // (640 pixels x 3 bytes / 4) and this used to be 256, so "a whole line is in
+    // hand" could never be true and the first line of every frame started short
+    // by a random amount -- the offset, different after every reset.  512 words
+    // plus a top-up near the top makes that condition real.
+    mm_frame_rd #(
+        .FIFO_AW (9),           // 512 words > ROW_WORDS (480)
+        .TOPUP   (500)
+    ) u_frame_rd (
         .clk            (mem_clk),
         .rst            (mem_rst),
         .base_word      (21'd0),            // picture 0 lives at word 0

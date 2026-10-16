@@ -165,7 +165,11 @@ module mm_frame_rd #(
     wire        can_burst  = !br_busy && app_ok && (burst_len != 9'd0);
     wire        flush_done_s = fd_s2;
 
-    assign pix_ready = (fifo_used >= (FIFO_DEPTH / 2));
+    // "primed" has to mean *a whole picture line is in hand* (ROW_WORDS = 480),
+    // not "half the buffer": with the old 256 word buffer half is 128, a quarter
+    // of a line, so unmasking on it left the first line short by a random amount
+    // -- which is the offset the picture showed, different after every reset.
+    assign pix_ready = (fifo_used >= ROW_WORDS);
     assign dbg_used   = fifo_used;
     assign dbg_app_ok = app_ok;
     assign dbg_mstate = mstate;
