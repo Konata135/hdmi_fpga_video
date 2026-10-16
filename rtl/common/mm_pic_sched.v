@@ -182,7 +182,12 @@ module mm_pic_sched #(
                     else                    retry_cnt <= retry_cnt - 21'd1;
                 end
 
-                default: state <= S_DONE;   // S_DONE: nothing left to load
+                // S_DONE: nothing left to load.  A card that is put in after
+                // the scan (the probe rescans when one appears) can add pictures
+                // to the table, so this is not a one-way door.
+                default: begin
+                    state <= any_want ? S_IDLE : S_DONE;
+                end
             endcase
         end
     end
