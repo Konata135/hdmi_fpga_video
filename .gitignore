@@ -1,0 +1,24 @@
+# -- build outputs and tool scratch ------------------------------------------
+# Anlogic TD regenerates all of this; none of it belongs in a source repository.
+prj/hdmi_player_Runs/
+prj/log/
+prj/.lock.f
+prj/.recent_user_depot.ini
+tmp_dbg/
+__pycache__/
+tools/__pycache__/
+
+# -- generated card images ---------------------------------------------------
+# tools/prepare_images.py writes these from 素材/图片.
+bmp_out/
+
+# -- vendor reference material -----------------------------------------------
+# 官方示例/ is 安路's example project: their encrypted IP, their PDFs, their
+# documents.  It stays in the working copy as a reference and is not published.
+官方示例/
+
+# -- editor / OS noise -------------------------------------------------------
+*.bak
+*~
+Thumbs.db
+desktop.ini
