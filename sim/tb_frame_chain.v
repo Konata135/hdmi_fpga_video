@@ -282,6 +282,7 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
         .start_lba    (START_LBA),
         .file_bytes   (FILE_BYTES[31:0]),
         .entry_valid  (1'b1),
+        .frame_base   (21'd0),      // slot 0: what the board puts picture 0 in
         .rd_lba       (ld_rd_lba_w),
         .rd_start     (ld_rd_start),
         .rd_busy      (p_busy),

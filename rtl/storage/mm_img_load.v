@@ -30,7 +30,6 @@
 
 module mm_img_load #(
     parameter integer HEADER_BYTES = 54,     // 14 byte file header + 40 byte info
-    parameter integer FRAME_BASE   = 0,      // first word of picture 0
     parameter integer READ_TRIES   = 3,
     // (2**18 - 1) words is the most words_total can carry
     parameter integer MAX_PIXEL_BYTES = 230400 * 4
@@ -38,12 +37,17 @@ module mm_img_load #(
     input  wire        clk,             // 50 MHz, the SD side
     input  wire        rst,
 
-    // start: load picture 0.  start_lba / file_bytes come from the scan table
-    // and must be stable while entry_valid is high.
+    // start: load the picture whose {start_lba, file_bytes} the table is
+    // presenting.  All three of these and frame_base have to be stable from the
+    // start pulse until the frame is in: they are sampled when the header has
+    // been checked and the frame is about to be written.
     input  wire        start,
     input  wire [31:0] start_lba,
     input  wire [31:0] file_bytes,
     input  wire        entry_valid,
+    // which slot of the frame store this picture goes into; the carousel gives
+    // each picture its own, so it cannot be a parameter any more
+    input  wire [20:0] frame_base,
 
     // the shared sector engine: pulse rd_start with rd_lba, wait for rd_done,
     // and read the bytes off rd_valid / rd_index / rd_byte as they stream by
@@ -164,7 +168,7 @@ module mm_img_load #(
             rd_lba        <= 32'd0;
             rd_start      <= 1'b0;
             frame_start   <= 1'b0;
-            base_word     <= FRAME_BASE;
+            base_word     <= frame_base;
             words_total   <= 18'd0;
             byte_valid    <= 1'b0;
             byte_data     <= 8'd0;
@@ -264,7 +268,7 @@ module mm_img_load #(
                         // base/words are held steady for the whole frame
                         pixel_bytes  <= pixel_bytes_q;
                         words_total  <= words_total_q;
-                        base_word    <= FRAME_BASE;
+                        base_word    <= frame_base;
                         sent         <= 32'd0;
                         bytes_sent   <= 32'd0;
                         sector       <= 16'd0;

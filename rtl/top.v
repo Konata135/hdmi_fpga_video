@@ -20,6 +20,12 @@
 module top (
     input  wire clk,           // 50 MHz on-board oscillator, pin R7
     input  wire rst_n,         // push button, active low, pin A2
+    // the controls, pins from the board manual (doc/参考-官方, section 15/16):
+    // KEY2 steps the picture on, and slide switch SW1 turns the automatic walk
+    // on (up = 1) and off (down = 0).  KEY3 (B1) and KEY4 (C1) also exist and
+    // are free; SW1-SW4 are C8/C7/C6/C5 if a different one is wanted.
+    input  wire key_next,      // pin B2, KEY2: next picture
+    input  wire sw_auto,       // pin C8, SW1: up = carousel on
 
     // HDMI type A on the HDMI_B connector
     output wire HDMI_CLK_P,
@@ -112,6 +118,16 @@ module top (
         .line_last   (line_last)
     );
 
+    // The first lines of the vertical blanking.  This is where a picture may be
+    // changed: the walk has to be stopped and re-pointed, and stopping it while
+    // the screen is showing something freezes whatever was on that line.  Eight
+    // lines is 0.26 ms, long enough for the flush and the re-prime to be over
+    // before the next frame boundary comes round, and short enough that a key
+    // press waits no longer than a frame for its slot.
+    localparam [10:0] V_BLANK_FIRST = 11'd480;
+    localparam [10:0] V_BLANK_LAST  = 11'd487;
+    wire pix_vblank_top = (v_cnt >= V_BLANK_FIRST) && (v_cnt <= V_BLANK_LAST);
+
     //------------------------------------------------------------------
     // picture source
     //
@@ -177,7 +193,9 @@ module top (
     wire [3:0]  sd_error;       // last failure code, 0 = none
     wire [7:0]  sd_capacity;    // partition size in GiB
     wire [63:0] sd_table;       // first picture: {start_lba, length_in_bytes}
-    wire [2:0]  sd_page_sel = 3'd0;
+    // which table entry is being presented: the carousel's scheduler owns this
+    // port now (it walks the table loading the pictures one at a time)
+    wire [2:0]  sd_page_sel;
 
     mm_sd_probe u_sd_probe (
         .clk            (clk),
@@ -233,7 +251,17 @@ module top (
     wire        br_dv, br_busy;
     wire        rd_pix_ready;          // reader: aligned to the frame and primed
     reg         rd_restart;            // reader: restart toggle, see further down
-    reg         frame_active_d;        // ... and the edge it is taken from
+    // which slot the walk belongs to, and the handshake that moves it: declared
+    // up here because the reader instance below is wired to `base_m` (a name
+    // used before its declaration becomes an implicit one-bit net, which this
+    // project has been bitten by before)
+    reg  [2:0]  slot_m;
+    reg  [20:0] base_m;
+    reg         slot_ready_m;
+    reg  [2:0]  slot_req;
+    reg         sw_pending;
+    reg         dt_s1, dt_s2, dt_prev;
+    reg         vb_s1, vb_s2;
     wire [15:0] rd_rows_seen;       // reader diagnostic: stored rows walked
     wire [8:0]  rd_used;            // reader diagnostic: words in its buffer
     wire        rd_app_ok;          // ... room for a whole run
@@ -440,9 +468,6 @@ module top (
         end
     end
 
-    reg         load_start;
-    reg  [26:0] load_timer;
-    reg         load_started;
     reg         frame_display;
 
     // The picture check's answer crosses the same way, on the falling edge of
@@ -485,16 +510,97 @@ module top (
     wire        frame_wr_done_tgl;
     wire        frame_wr_busy;
 
+    //------------------------------------------------------------------
+    // the picture carousel
+    //
+    // Eight pictures live one per slot of the frame store (doc/SDRAM内存映射.md:
+    // slot i at i * 230400 words).  The same loader M5 used fills them one at a
+    // time, slot 0 first: the screen comes up on the first picture and the rest
+    // are fetched behind it, through the write port while the reader fetches
+    // through the burst port -- which is what the controller's two ports are
+    // for.  KEY2 steps on to the next loaded picture; slide switch SW1 keeps the
+    // automatic one-per-second walk running while it is up.
+    //
+    // The keys are buttons to ground (idle high, pressed low), so the debouncer
+    // for one inverts; the switch reads 1 when it is up, so it does not.  Both
+    // are mechanical contacts and both need the filter.
+    //------------------------------------------------------------------
+    wire key_next_level, key_next_press;
+    wire sw_auto_level;
+
+    mm_key_debounce #(.INVERT(1)) u_key_next (
+        .clk   (clk),
+        .rst   (~por_n),
+        .raw   (key_next),
+        .level (key_next_level),
+        .press (key_next_press)
+    );
+
+    mm_key_debounce u_sw_auto (
+        .clk   (clk),
+        .rst   (~por_n),
+        .raw   (sw_auto),
+        .level (sw_auto_level),
+        .press ()
+    );
+
+    // the switch is a level, and it is already debounced
+    wire auto_on = sw_auto_level;
+
+    wire [2:0] sched_tbl_index;
+    wire [2:0] disp_sel;
+    wire       disp_tgl;
+    wire       sched_load_start;
+    wire [2:0] sched_load_slot;
+    wire [3:0] sched_state, loaded_count;
+
+    assign sd_page_sel = sched_tbl_index;
+
+    mm_pic_sched u_pic_sched (
+        .clk          (clk),
+        .rst          (~por_n),
+        .tbl_index    (sched_tbl_index),
+        .images_found (sd_images),
+        .scan_parked  (sd_phase == 4'hC),
+        .load_start   (sched_load_start),
+        .load_slot    (sched_load_slot),
+        .load_busy    (ld_busy),
+        .load_done    (ld_done),
+        .load_phase   (ld_phase),
+        .key_press    (key_next_press),
+        .auto_on      (auto_on),
+        .disp_sel     (disp_sel),
+        .disp_tgl     (disp_tgl),
+        .loaded_count (loaded_count),
+        .state_dbg    (sched_state)
+    );
+
+    // Slot i starts at i * 230400 words = (i * 225) << 10, and 225 is
+    // 128 + 64 + 32 + 1: four shifts and three adders, no multiplier.
+    function [20:0] slot_base;
+        input [2:0] s;
+        reg [20:0] t;
+        begin
+            t = ({18'd0, s} << 7) + ({18'd0, s} << 6) +
+                ({18'd0, s} << 5) + {18'd0, s};
+            slot_base = t << 10;
+        end
+    endfunction
+
+    wire [20:0] load_base = slot_base(sched_load_slot);
+
     wire [31:0] img_start_lba = sd_table[63:32];
     wire [31:0] img_length    = sd_table[31:0];
 
     mm_img_load u_img_load (
         .clk          (clk),
         .rst          (~por_n),
-        .start        (load_start),
+        .start        (sched_load_start),
         .start_lba    (img_start_lba),
         .file_bytes   (img_length),
-        .entry_valid  (sd_images != 4'd0),
+        // the scheduler only starts loads for slots the scan vouched for
+        .entry_valid  (1'b1),
+        .frame_base   (load_base),
         .rd_lba       (ld_rd_lba),
         .rd_start     (ld_rd_start),
         .rd_busy      (aux_sec_busy),
@@ -568,7 +674,7 @@ module top (
     mm_frame_rd u_frame_rd (
         .clk            (mem_clk),
         .rst            (mem_rst),
-        .base_word      (21'd0),            // picture 0 lives at word 0
+        .base_word      (base_m),           // whichever slot is on screen
         .active         (frame_active),
         .restart        (rd_restart),
         .br_req         (rd_b_req),
@@ -596,45 +702,16 @@ module top (
     );
 
     //------------------------------------------------------------------
-    // when to load, and when the picture takes the screen
+    // when a picture is on its way to the screen
     //
-    // Start once the scan has parked (phase C) with at least one picture
-    // found.  A load that fails is retried once a second for as long as it
-    // keeps failing, so pulling the card and putting it back is enough to
-    // recover -- nothing here can wedge, it just keeps showing the pattern.
+    // Starting the loads is the scheduler's business now (slot 0 first, then
+    // the rest behind it, with the retries it keeps for a load that fails).
+    // This only remembers that *something* has been loaded, which is what the
+    // probe's picture check waits for.
     //------------------------------------------------------------------
-    localparam [26:0] LOAD_RETRY_CYCLES = 27'd49_999_999;   // 1 s at 50 MHz
-
     always @(posedge clk or negedge por_n) begin
-        if (!por_n) begin
-            load_start    <= 1'b0;
-            load_started  <= 1'b0;
-            frame_display <= 1'b0;
-            load_timer    <= 27'd0;
-        end else begin
-            load_start <= 1'b0;
-
-            if (ld_done)
-                frame_display <= 1'b1;
-
-            if (!load_started) begin
-                // the probe must have finished with the single word port before
-                // the loader can ask the writer to start using it
-                if (!st_busy_s2 && (sd_phase == 4'hC) && (sd_images != 4'd0)) begin
-                    load_start   <= 1'b1;
-                    load_started <= 1'b1;
-                end
-            end else if (!frame_display && (ld_phase == 4'hF)) begin
-                if (load_timer == LOAD_RETRY_CYCLES) begin
-                    load_timer <= 27'd0;
-                    load_start <= 1'b1;
-                end else begin
-                    load_timer <= load_timer + 27'd1;
-                end
-            end else begin
-                load_timer <= 27'd0;
-            end
-        end
+        if (!por_n)           frame_display <= 1'b0;
+        else if (ld_done)     frame_display <= 1'b1;
     end
 
     // The reader may start fetching as soon as the frame is in (that is what
@@ -664,25 +741,64 @@ module top (
         end
     end
 
-    assign frame_active = frame_display_m2;
+    //------------------------------------------------------------------
+    // pointing the reader at the slot the scheduler is showing
+    //
+    // The scheduler announces a slot as a value plus a toggle (`disp_sel` /
+    // `disp_tgl`): by the time the edge arrives here the value has been standing
+    // for the synchroniser's two cycles, so it is safe to take as a whole -- the
+    // way this project moves a multi-bit quantity across a clock domain, and not
+    // by synchronising its bits one by one.
+    //
+    // A change is then applied in the *vertical blanking*.  Stopping the walk to
+    // re-point it freezes whatever the screen was showing; doing that while the
+    // blanking is on costs nothing, and the flush and re-prime are over long
+    // before the frame boundary comes round.  Only the first picture goes in
+    // wherever it lands, because there is nothing on screen to disturb yet.
+    //
+    // The reader's `restart` (M5) does the rest: re-arm on the new picture's
+    // first word, throw the buffer away, wait for a frame boundary, and the
+    // unmask only after it says it is primed again.
+    //------------------------------------------------------------------
+    wire sw_edge = dt_s2 ^ dt_prev;
 
-    // One restart when the picture becomes the source, taken from the
-    // *synchronised* level so this edge and the reader's agree.  The reader
-    // answers it by putting its walk back on the picture's first word, throwing
-    // the buffer away and starting again on the next display frame boundary -- so
-    // the picture lands on the screen with its own first pixel in the frame's
-    // first pixel, instead of at whatever offset the free running walk had
-    // reached.  A toggle, which is what the reader's synchroniser expects.
     always @(posedge mem_clk) begin
         if (mem_rst) begin
-            frame_active_d <= 1'b0;
-            rd_restart     <= 1'b0;
+            dt_s1        <= 1'b0;
+            dt_s2        <= 1'b0;
+            dt_prev      <= 1'b0;
+            slot_req     <= 3'd0;
+            sw_pending   <= 1'b0;
+            vb_s1        <= 1'b0;
+            vb_s2        <= 1'b0;
+            slot_m       <= 3'd0;
+            base_m       <= 21'd0;
+            slot_ready_m <= 1'b0;
+            rd_restart   <= 1'b0;
         end else begin
-            frame_active_d <= frame_active;
-            if (frame_active && !frame_active_d)
-                rd_restart <= ~rd_restart;
+            dt_s1   <= disp_tgl;
+            dt_s2   <= dt_s1;
+            dt_prev <= dt_s2;
+            vb_s1   <= pix_vblank_top;
+            vb_s2   <= vb_s1;
+
+            if (sw_edge) begin
+                slot_req   <= disp_sel;
+                sw_pending <= 1'b1;
+            end
+
+            if (sw_pending && (!slot_ready_m || vb_s2)) begin
+                slot_m       <= slot_req;
+                base_m       <= slot_base(slot_req);
+                rd_restart   <= ~rd_restart;
+                slot_ready_m <= 1'b1;
+                sw_pending   <= 1'b0;
+            end
         end
     end
+
+    // the reader only ever fetches from a slot the scheduler vouched for
+    assign frame_active = slot_ready_m;
 
     // The probe's picture check starts when the picture is on screen.  The wire
     // itself is declared up at the probe (it has to be: a name used before its
@@ -745,11 +861,17 @@ module top (
         end
     end
 
-    reg frame_display_s1, frame_display_s2;
+    reg slot_ready_s1, slot_ready_s2;
     reg frame_show;
-    // Where the picture takes the screen.  Two things have to be true, and both
-    // are about the reader's own state rather than a race between the buffer
-    // filling and the frame boundary coming round:
+    // Where the picture takes the screen.  Three things have to be true, and all
+    // of them are about somebody else's state rather than a race between the
+    // buffer filling and the frame boundary coming round:
+    //
+    //   * the scheduler has announced which slot the reader is pointed at
+    //     (`slot_ready`), so the screen never shows a slot that has not been
+    //     loaded -- with the carousel loading pictures behind the one on screen,
+    //     "the reader is running" is no longer the same thing as "there is a
+    //     picture here"
     //
     //   * the reader is *aligned*: after the restart above it holds its walk on
     //     the picture's first word and blocks itself until a display frame
@@ -773,18 +895,18 @@ module top (
 
     always @(posedge pix_clk) begin
         if (pix_rst) begin
-            frame_display_s1 <= 1'b0;
-            frame_display_s2 <= 1'b0;
-            frame_show       <= 1'b0;
-            rd_ready_s1      <= 1'b0;
-            rd_ready_s2      <= 1'b0;
+            slot_ready_s1 <= 1'b0;
+            slot_ready_s2 <= 1'b0;
+            frame_show    <= 1'b0;
+            rd_ready_s1   <= 1'b0;
+            rd_ready_s2   <= 1'b0;
         end else begin
-            frame_display_s1 <= frame_display;
-            frame_display_s2 <= frame_display_s1;
-            rd_ready_s1      <= rd_pix_ready;
-            rd_ready_s2      <= rd_ready_s1;
+            slot_ready_s1 <= slot_ready_m;
+            slot_ready_s2 <= slot_ready_s1;
+            rd_ready_s1   <= rd_pix_ready;
+            rd_ready_s2   <= rd_ready_s1;
             if (frame_next)
-                frame_show <= frame_display_s2 && rd_ready_s2;
+                frame_show <= slot_ready_s2 && rd_ready_s2;
         end
     end
 
@@ -901,8 +1023,10 @@ module top (
             page     <= 4'd0;
         end else if (page_cnt == 27'd99_999_999) begin
             page_cnt <= 27'd0;
-            // pages 15 and 16 are retired (see the page table): step over them
-            page     <= (page == 4'd14)     ? 5'd17 :
+            // page 16 is retired (see the page table): step over it.  Page 15 is
+            // the carousel's own page now, so it stays in the rotation.
+            page     <= (page == 4'd14)     ? 5'd15 :
+                        (page == 4'd15)     ? 5'd17 :
                         (page == PAGE_LAST) ? 5'd0  :
                                               (page + 5'd1);
         end else begin
@@ -1040,9 +1164,20 @@ module top (
             // to the transmitter.  They were removed: the sampling instants did
             // not line up with the pixel they were supposed to capture, so the
             // readings belonged to nothing (docs/路线图.md, 2026-10-17) -- and a
-            // meter that can be wrong is worse than no meter.  The rotation
-            // skips them; the numbers below kept their page numbers so nothing
-            // else had to be renumbered.
+            // meter that can be wrong is worse than no meter.  Page 15 has since
+            // been given to the carousel (below); page 16 is still retired and
+            // the rotation steps over it.  The numbers below kept their page
+            // numbers so nothing else had to be renumbered.
+            //
+            // The carousel: which picture is on screen (d4), how many pictures
+            // are in their slots (d3), and whether the switch is up (d2, 1/0).
+            // d4 sitting still while the switch is up means either only one
+            // picture loaded or the switch is off; a key press should walk it.
+            5'd15: begin
+                pg_hi  = {1'b0, disp_sel};
+                pg_mid = loaded_count;
+                pg_lo  = {3'b000, auto_on};
+            end
             // Is that same stream as fresh as the reader says it is?  11A (282)
             // = every displayed pixel is a fresh picture pixel; much smaller =
             // the screen is being fed repeats.

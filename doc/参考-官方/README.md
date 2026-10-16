@@ -7,6 +7,7 @@
 |---|---|
 | `设计参考例程文档.md`、`代码说明.md` | 厂商对样例行为的说明（4 张图、SDRAM 双缓冲、key1/key2 行为、卡格式要求），本工程的功能基线就是对齐它 |
 | `pin.adc`、`timing.sdc` | **板上事实的来源**：HDMI 引脚属性（LOCATION/IOSTANDARD/PULLTYPE）与本工程 `constraints/` 里那条 `clkc[2]↔clkc[3]` 例外，都是照它抄的 |
+| `HX4S20开发板手册-HDL版2410.pdf` | **开发板手册**（2.4 MB）：第 15 节 4 个乒乓开关 SW1-SW4 = C8/C7/C6/C5（拨上为 1），第 16 节 4 个按键 KEY1-KEY4 = A2/B2/B1/C1（按下为低）。本工程的复位/切图/轮播开关引脚就出自这里 |
 | `hdl/*.v` | 样例里**未加密**的 SD 扫描 / BMP 读 / 帧 FIFO / 彩条 / 数码管 / 按键消抖 / 音频与 I2S 源码，用于交叉核对（本工程 RTL 全部自研，不复制它们） |
 | `convert_images_to_bmp.py`、`sync_to_sd.py`、`convert/README.md` | 厂商的图片转换与写卡脚本，本工程 `tools/prepare_images.py` / `write_card.py` 的思路来源 |
 

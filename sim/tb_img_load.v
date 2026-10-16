@@ -172,14 +172,14 @@ module tb_img_load;
     // the unit under test
     //------------------------------------------------------------------
     mm_img_load #(
-        .HEADER_BYTES (54),
-        .FRAME_BASE   (0)
+        .HEADER_BYTES (54)
     ) dut (
         .clk          (clk),
         .rst          (rst),
         .start        (start),
         .start_lba    (start_lba),
         .file_bytes   (file_bytes),
+        .frame_base   (21'd0),      // the frame store starts at word 0 here
         .entry_valid  (entry_valid),
         .rd_lba       (rd_lba),
         .rd_start     (rd_start),
