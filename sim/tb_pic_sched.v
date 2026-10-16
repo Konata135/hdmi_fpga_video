@@ -7,9 +7,11 @@
 //   1. nothing is asked of the loader until the scan has parked
 //   2. the slots are loaded in order, one loader run at a time -- the model
 //      counts a hit if a start ever arrives while it is still working
-//   3. the first picture to arrive takes the screen, and every change of
-//      `disp_sel` toggles `disp_tgl` exactly once (that toggle is how the top
-//      level re-points the reader)
+//   3. the first picture to arrive is announced exactly once *even when it is
+//      the slot that was already selected*, and every later change of `disp_sel`
+//      toggles `disp_tgl` exactly once -- that toggle is how the top level knows
+//      it may point the reader at a slot, and leaving the first one out is what
+//      put nothing but colour bars on the screen
 //   4. a key press walks to the next *loaded* picture and wraps round
 //   5. the switch makes the same walk happen by itself, and with the switch off
 //      nothing moves however long the test waits
@@ -179,15 +181,27 @@ module tb_pic_sched;
                 $display("  load order   : PASS (0, 1, 1 retry, 2; slot 1 given up on)");
         end
 
-        // ---- 3. the announce toggle -------------------------------------
+        // ---- 3. the first picture is announced, and announced once ------
+        // This is the half of the contract the board cares about most: the top
+        // level only lets the reader fetch once the scheduler has told it which
+        // slot to point at.  Leaving the *first* announce out (because the slot
+        // happened to be the one already selected) is exactly the failure that
+        // showed nothing but the colour bars on the board, and this testbench
+        // missed it because it only counted the toggle on a key press.
+        if (toggles != 1)
+            fail("the first picture was not announced exactly once");
+        else
+            $display("  announce     : PASS (one toggle when the first picture arrived)");
+
+        // ---- 4. one more toggle per change ------------------------------
         toggles_before = toggles;
         press_key;
         if (toggles != toggles_before + 1)
             fail("a change of disp_sel did not toggle disp_tgl exactly once");
         else
-            $display("  announce     : PASS (one toggle per change)");
+            $display("  step toggle  : PASS (one toggle per change)");
 
-        // ---- 4. the key walks the loaded set and wraps ------------------
+        // ---- 5. the key walks the loaded set and wraps ------------------
         // loaded set is {0, 2}: from 0 the next is 2, and from 2 it wraps to 0
         if (disp_sel !== 3'd2)
             fail("the key did not step on to the next loaded picture");
@@ -199,7 +213,7 @@ module tb_pic_sched;
         else
             $display("  wrap         : PASS (2 -> 0)");
 
-        // ---- 5. the switch runs the same walk by itself -----------------
+        // ---- 6. the switch runs the same walk by itself -----------------
         auto_on = 1'b1;
         k = 0;
         while ((disp_sel == 3'd0) && (k < 4 * CAROU)) begin

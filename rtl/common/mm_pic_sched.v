@@ -71,6 +71,7 @@ module mm_pic_sched #(
 
     reg  [7:0]  loaded;                 // slots with a picture in them
     reg  [7:0]  bad;                    // slots given up on
+    reg         announced;              // the top level has been told which slot
     reg  [2:0]  state;
     reg  [2:0]  slot;                   // the slot being fetched
     reg  [1:0]  tries;
@@ -209,18 +210,24 @@ module mm_pic_sched #(
             disp_sel  <= 3'd0;
             disp_tgl  <= 1'b0;
             carou_cnt <= 27'd0;
+            announced <= 1'b0;      // driven here and nowhere else
         end else begin
             if (carou_tick)         carou_cnt <= 27'd0;
             else if (auto_on)       carou_cnt <= carou_cnt + 27'd1;
 
-            if ((loaded != 8'd0) && !loaded[disp_sel]) begin
-                // nothing has been announced for the slot on screen yet: the
-                // first picture to arrive takes it.  The announce has to be a
-                // toggle even when the slot does not change, because the top
-                // level only lets the reader fetch once it has been told which
-                // slot to point at.
-                disp_sel <= next_set(loaded, 3'd0);
-                disp_tgl <= ~disp_tgl;
+            if ((loaded != 8'd0) && (!announced || !loaded[disp_sel])) begin
+                // The first picture to arrive takes the screen, and the top
+                // level has to be *told*.  It only lets the reader fetch once it
+                // has been told which slot to point at, and "slot 0, the one we
+                // were going to show anyway" is still something it has to be
+                // told: leaving that one out is how the board ended up showing
+                // nothing but the colour bars (the picture loaded into slot 0
+                // and nothing ever pointed the reader at it).  The same branch
+                // covers the other order, where the first picture to arrive is
+                // not the slot we started on.
+                disp_sel  <= next_set(loaded, 3'd0);
+                disp_tgl  <= ~disp_tgl;
+                announced <= 1'b1;
             end else if (step_now) begin
                 disp_sel <= adv_to;
                 disp_tgl <= ~disp_tgl;
