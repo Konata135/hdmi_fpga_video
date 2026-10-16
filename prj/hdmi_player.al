@@ -188,7 +188,7 @@
             </File>
         </Verilog>
         <ADC_FILE>
-            <File Path="../con/hx4s20c_pin.adc">
+            <File Path="../constraints/hx4s20c_pin.adc">
                 <FileInfo>
                     <Attr Name="UsedInSyn" Val="true"/>
                     <Attr Name="UsedInP&R" Val="true"/>
@@ -198,7 +198,7 @@
             </File>
         </ADC_FILE>
         <SDC_FILE>
-            <File Path="../con/hdmi_player.sdc">
+            <File Path="../constraints/hdmi_player.sdc">
                 <FileInfo>
                     <Attr Name="UsedInSyn" Val="true"/>
                     <Attr Name="UsedInP&R" Val="true"/>
