@@ -544,15 +544,13 @@ module top (
         .words_written  ()
     );
 
-    // The word buffer must hold more than one picture line: a line is 480 words
-    // (640 pixels x 3 bytes / 4) and this used to be 256, so "a whole line is in
-    // hand" could never be true and the first line of every frame started short
-    // by a random amount -- the offset, different after every reset.  512 words
-    // plus a top-up near the top makes that condition real.
-    mm_frame_rd #(
-        .FIFO_AW (9),           // 512 words > ROW_WORDS (480)
-        .TOPUP   (500)
-    ) u_frame_rd (
+    // 256 words of word buffer here, primed to 128 before the picture is
+    // unmasked.  A 512 word version (one whole line) was tried and reverted: on
+    // the board the extra distributed RAM took the hold margin from +30 ps to
+    // +14 ps and the picture stopped coming up at all, so that buffer has to
+    // become a BRAM one before it is worth having.  It is *not* the offset's
+    // root cause anyway -- see doc/路线图.md.
+    mm_frame_rd u_frame_rd (
         .clk            (mem_clk),
         .rst            (mem_rst),
         .base_word      (21'd0),            // picture 0 lives at word 0
