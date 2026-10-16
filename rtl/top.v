@@ -87,6 +87,7 @@ module top (
     wire        vs;
     wire        de;
     wire        frame_first;
+    wire        frame_next;
     wire        line_last;
 
     mm_video_timing #(
@@ -107,6 +108,7 @@ module top (
         .vs          (vs),
         .de          (de),
         .frame_first (frame_first),
+        .frame_next  (frame_next),
         .line_last   (line_last)
     );
 
@@ -229,7 +231,9 @@ module top (
     wire [20:0] wr_addr;
     wire [31:0] wr_data;
     wire        br_dv, br_busy;
-    wire        rd_pix_ready;          // reader: its word buffer is primed
+    wire        rd_pix_ready;          // reader: aligned to the frame and primed
+    reg         rd_restart;            // reader: restart toggle, see further down
+    reg         frame_active_d;        // ... and the edge it is taken from
     wire [15:0] rd_rows_seen;       // reader diagnostic: stored rows walked
     wire [8:0]  rd_used;            // reader diagnostic: words in its buffer
     wire        rd_app_ok;          // ... room for a whole run
@@ -550,11 +554,23 @@ module top (
     // +14 ps and the picture stopped coming up at all, so that buffer has to
     // become a BRAM one before it is worth having.  It is *not* the offset's
     // root cause anyway -- see doc/路线图.md.
+    //
+    // What the offset actually was: the reader walks the picture continuously and
+    // the screen changes over on a *display* frame boundary, so where in the
+    // picture the walk was when the screen changed over decided the offset -- and
+    // that is not something a deeper buffer can change.  `restart` is that fix:
+    // the walk is re-armed on the picture's first word and blocked until the next
+    // display frame boundary, and the picture is only unmasked once the reader
+    // says it is aligned (`pix_ready`), i.e. on the frame after the one that
+    // fills the buffer.  `frame_next` rather than `frame_first` is what the
+    // unmask and the reader both act on, so the frame's *first* pixel is already
+    // the picture's; see mm_frame_rd's header.
     mm_frame_rd u_frame_rd (
         .clk            (mem_clk),
         .rst            (mem_rst),
         .base_word      (21'd0),            // picture 0 lives at word 0
         .active         (frame_active),
+        .restart        (rd_restart),
         .br_req         (rd_b_req),
         .br_addr        (rd_b_addr),
         .br_len         (rd_b_len),
@@ -572,6 +588,7 @@ module top (
         .pix_clk        (pix_clk),
         .pix_rst        (pix_rst),
         .pix_de         (de),
+        .pix_frame_next (frame_next),
         .pix_rgb        (frame_rgb),
         .pix_valid      (frame_valid),
         .pix_underrun   (frame_underrun),
@@ -621,10 +638,15 @@ module top (
     end
 
     // The reader may start fetching as soon as the frame is in (that is what
-    // `active` says), but the screen changes over on a frame boundary, not in
-    // the middle of one: a source that changed halfway down would show a seam,
-    // and by the time the boundary comes the reader's buffer is primed, so the
-    // first line of the picture is complete.
+    // `active` says), and it is unmasked at a frame boundary rather than in the
+    // middle of a frame, because a source that changed halfway down would show a
+    // seam.  Fetching early is not enough on its own, though: the *walk* is what
+    // the display is slaved to, so a walk let go the moment the frame is in
+    // leaves the picture at whatever offset it had reached by the time the
+    // boundary came -- that was the offset, and why it differed after every
+    // reset.  The reader is restarted below so that its walk begins *on* a frame
+    // boundary, and the unmask happens a frame later, when the reader says it is
+    // aligned and its buffer primed.
     // `frame_display` is set in the 50 MHz domain and read by the reader in the
     // memory one, so it goes through a synchroniser instead of straight into
     // the fetch logic.  It only ever changes once, but two flops cost nothing
@@ -643,6 +665,24 @@ module top (
     end
 
     assign frame_active = frame_display_m2;
+
+    // One restart when the picture becomes the source, taken from the
+    // *synchronised* level so this edge and the reader's agree.  The reader
+    // answers it by putting its walk back on the picture's first word, throwing
+    // the buffer away and starting again on the next display frame boundary -- so
+    // the picture lands on the screen with its own first pixel in the frame's
+    // first pixel, instead of at whatever offset the free running walk had
+    // reached.  A toggle, which is what the reader's synchroniser expects.
+    always @(posedge mem_clk) begin
+        if (mem_rst) begin
+            frame_active_d <= 1'b0;
+            rd_restart     <= 1'b0;
+        end else begin
+            frame_active_d <= frame_active;
+            if (frame_active && !frame_active_d)
+                rd_restart <= ~rd_restart;
+        end
+    end
 
     // The probe's picture check starts when the picture is on screen.  The wire
     // itself is declared up at the probe (it has to be: a name used before its
@@ -707,13 +747,28 @@ module top (
 
     reg frame_display_s1, frame_display_s2;
     reg frame_show;
-    // The reader's word buffer has to be primed before the picture is unmasked,
-    // otherwise the first pixels of the frame have nothing to show: they repeat
-    // the last one, which shifts the whole picture sideways and, because a line
-    // wraps, leaves a second copy at the edge.  Whether the buffer is primed by
-    // the time the frame boundary comes round is a race, so it was "fine the
-    // first few resets" and then visibly offset.  `pix_ready` existed for this
-    // and was never wired up.
+    // Where the picture takes the screen.  Two things have to be true, and both
+    // are about the reader's own state rather than a race between the buffer
+    // filling and the frame boundary coming round:
+    //
+    //   * the reader is *aligned*: after the restart above it holds its walk on
+    //     the picture's first word and blocks itself until a display frame
+    //     boundary, so this can only be satisfied from the frame after the one
+    //     that primed the buffer -- which is what "the next frame takes over"
+    //     means
+    //   * the word buffer is primed, or the first pixels of the frame have
+    //     nothing to show and repeat the last one, shifting the picture sideways
+    //     with a second copy at the end of the line
+    //
+    // `rd_pix_ready` is the reader saying both are true.  `pix_ready` existed for
+    // this and was never wired up.
+    //
+    // The decision is taken on `frame_next`, the blanking pixel *before* the
+    // boundary, not on `frame_first`: a decision registered in the boundary cycle
+    // itself only lands on the cycle after it, which would show the pattern in
+    // the frame's first pixel and put the picture one pixel out -- and one pixel
+    // out of step at 640 pixels per line is not one pixel out of place in one
+    // line, it is the picture wrapping round a little further on every line.
     reg rd_ready_s1, rd_ready_s2;
 
     always @(posedge pix_clk) begin
@@ -728,7 +783,7 @@ module top (
             frame_display_s2 <= frame_display_s1;
             rd_ready_s1      <= rd_pix_ready;
             rd_ready_s2      <= rd_ready_s1;
-            if (frame_first)
+            if (frame_next)
                 frame_show <= frame_display_s2 && rd_ready_s2;
         end
     end

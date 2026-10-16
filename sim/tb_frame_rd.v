@@ -17,10 +17,34 @@
 // row in the bottom byte, which nails the row order (BMP is bottom up), the
 // column order and the B,G,R -> R,G,B swap in one comparison.
 //
-//  1. one whole frame of pixels matches, with no underrun
-//  2. switching to another frame at another base reads that frame
-//  3. with `active` low the reader stops fetching
-//  4. the SDRAM model saw no protocol violation
+// Crucially the check is on the *position* as well as the order: the pixel this
+// module hands out at display position n of a frame has to be pixel n of the
+// picture.  The order-only version of this check (collect the pixels it hands
+// out and compare them one by one) cannot see an offset at all -- a picture
+// shifted sideways within the line, or down by whole lines, hands out exactly
+// the same sequence.  Position is the *display's*, counted in this testbench's
+// own de cycles, so the picture is judged against the screen and not against
+// itself.
+//
+// The top level's takeover rule is modelled here too, so the test covers the
+// whole sequence the board runs and not just the reader: the picture becoming
+// the source is a pulse into the reader's `restart`, and the unmask is a
+// registered decision taken on the blanking pixel *before* a frame boundary
+// (frame_next) out of the reader's "aligned and primed" signal.  Taking it on
+// frame_first instead would put the frame's first pixel in the pattern, and the
+// position check is what notices that.
+//
+//  1. a picture that becomes the source part way through a frame -- the
+//     condition that used to leave it offset, by a different amount after every
+//     reset -- is on the screen from the frame's first pixel, in the right
+//     place, with nothing missing and no underrun
+//  2. it stays aligned frame after frame: the walk goes past exactly one picture
+//     per display frame, or the next frame's positions would be out
+//  3. a restart in the middle of a frame re-aligns it again, three times, landing
+//     at a different point in the frame each time
+//  4. switching to another frame at another base reads that frame
+//  5. with `active` low the reader stops fetching
+//  6. the SDRAM model saw no protocol violation
 //=============================================================================
 `timescale 1ns / 100ps
 
@@ -29,11 +53,20 @@ module tb_frame_rd;
     localparam integer ROW_WORDS = 12;      // 48 bytes = 16 pixels per row
     localparam integer ROWS      = 4;
     localparam integer PIXELS    = ROW_WORDS * 4 / 3;
+    localparam integer FRAME_PIX = ROWS * PIXELS;   // one whole display frame
+    localparam integer BLANK     = 4;               // blank pixels between lines
 
     reg         clk, clk_sft, pix_clk;
     reg         rst, pix_rst;
     reg  [20:0] base_word;
-    reg         active;
+    reg         loaded;             // the picture is in the store: this is the
+                                    // top level's frame_display, the thing that
+                                    // starts all of this off
+    reg         sw_restart;         // this side asking for a restart that is not
+                                    // a load -- what M6 will do on a switch
+    reg         pix_de;
+    reg         pix_frame_next;     // one pixel clock before a frame's first
+                                    // active pixel, as the timing generator has it
     wire        rd_br_req;
     wire [20:0] rd_br_addr;
     wire [8:0]  rd_br_len;
@@ -44,15 +77,28 @@ module tb_frame_rd;
     wire        rd_flush_done;
     wire [31:0] words_fetched;
     wire        pix_ready;
-    reg         pix_de;
     wire [23:0] pix_rgb;
     wire        pix_valid;
     wire [15:0] pix_underrun;
 
-    integer errors, i, r, c, w, k;
-    integer line, col;
-    integer count_fetched_before;
-    reg [7:0] marker_q;         // which stored picture the checker expects
+    integer errors = 0, i, r, c, w, k;
+    integer count_fetched_before, errors_before;
+    integer clean_before, shown_before;
+    integer base_a, base_b;
+
+    // display frame accounting, and the checks that go with it
+    integer dpos = 0;               // which pixel of the display frame is on the
+                                    // wire right now
+    integer frames_played = 0;
+    integer shown_frames  = 0;      // frames the picture was on the screen for,
+                                    // end to end
+    integer clean_frames  = 0;      // ... and every pixel of them was the right
+                                    // one, in the right place
+    integer shown_in_frame = 0;
+    integer bad_in_frame   = 0;
+    integer miss_in_frame  = 0;
+    reg     skipped = 1'b0;         // the reader was re-arming during this frame,
+                                    // so nothing is claimed about what was on it
 
     // what the display side should see: R,G,B with the marker, the column and
     // the flipped row.  A function is used so the field widths stay 8 bits.
@@ -63,10 +109,18 @@ module tb_frame_rd;
         reg [7:0] flipped;
         begin
             flipped = ROWS - 1 - v;             // stored row this line needs
-            rbyte   = 8'hA5           ^ marker_q;
-            gbyte   = (8'h20 + cc[7:0]) ^ marker_q;
-            bbyte   = (8'h10 + flipped) ^ marker_q;
+            rbyte   = 8'hA5;
+            gbyte   = 8'h20 + cc[7:0];
+            bbyte   = 8'h10 + flipped;
             expect_rgb = {rbyte, gbyte, bbyte};
+        end
+    endfunction
+
+    // what display position n of a frame must show
+    function [23:0] expect_pos;
+        input integer n;
+        begin
+            expect_pos = expect_rgb(n / PIXELS, n % PIXELS);
         end
     endfunction
 
@@ -130,6 +184,55 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         .br_busy    (rd_br_busy)
     );
 
+    //------------------------------------------------------------------
+    // the top level's takeover rule, modelled here so the test covers the whole
+    // sequence the board runs rather than the reader on its own
+    //
+    // `loaded` is frame_display: two flops into the memory domain and the rise of
+    // *that* asks the reader to restart (a level is no use as an edge), two flops
+    // into the pixel domain, and the unmask is decided on frame_next -- the
+    // blanking pixel before the boundary -- out of the reader's own "aligned and
+    // primed" answer.
+    //------------------------------------------------------------------
+    reg  active_m1, active_m2, active_d;
+    reg  sw_restart_d;
+    reg  restart;
+    reg  loaded_s1, loaded_s2, ready_s1, ready_s2, show;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            active_m1    <= 1'b0;
+            active_m2    <= 1'b0;
+            active_d     <= 1'b0;
+            sw_restart_d <= 1'b0;
+            restart      <= 1'b0;
+        end else begin
+            active_m1    <= loaded;
+            active_m2    <= active_m1;
+            active_d     <= active_m2;
+            sw_restart_d <= sw_restart;
+            if ((active_m2 && !active_d) || (sw_restart && !sw_restart_d))
+                restart <= ~restart;
+        end
+    end
+
+    always @(posedge pix_clk) begin
+        if (pix_rst) begin
+            loaded_s1 <= 1'b0;
+            loaded_s2 <= 1'b0;
+            ready_s1  <= 1'b0;
+            ready_s2  <= 1'b0;
+            show      <= 1'b0;
+        end else begin
+            loaded_s1 <= loaded;
+            loaded_s2 <= loaded_s1;
+            ready_s1  <= pix_ready;
+            ready_s2  <= ready_s1;
+            if (pix_frame_next)         // decide before the boundary, not on it
+                show <= loaded_s2 && ready_s2;
+        end
+    end
+
     mm_frame_rd #(
         .ROW_WORDS (ROW_WORDS),
         .ROWS      (ROWS),
@@ -140,7 +243,8 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         .clk           (clk),
         .rst           (rst),
         .base_word     (base_word),
-        .active        (active),
+        .active        (active_m2),
+        .restart       (restart),
         .br_req        (rd_br_req),
         .br_addr       (rd_br_addr),
         .br_len        (rd_br_len),
@@ -154,25 +258,74 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         .pix_clk       (pix_clk),
         .pix_rst       (pix_rst),
         .pix_de        (pix_de),
+        .pix_frame_next(pix_frame_next),
         .pix_rgb       (pix_rgb),
         .pix_valid     (pix_valid),
         .pix_underrun  (pix_underrun)
     );
 
-    // check every pixel as it is handed out
+    //------------------------------------------------------------------
+    // the checks: what is on the wire at each display position of each frame
+    //
+    // Frames are closed at the testbench's own frame boundaries, so the picture
+    // is judged against the screen.  A frame where the picture was on screen from
+    // its first pixel to its last is counted, and it has to have been right
+    // everywhere: the pixel at each display position, and a pixel at all (a
+    // missing one repeats the previous pixel, which shifts everything after it).
+    //------------------------------------------------------------------
     always @(posedge pix_clk) begin
-        if (!pix_rst && pix_valid) begin
-            if (pix_rgb !== expect_rgb(line, col)) begin
+        if (pix_rst) begin
+            dpos           = 0;
+            shown_in_frame = 0;
+            bad_in_frame   = 0;
+            miss_in_frame  = 0;
+            skipped        = 1'b0;
+        end else if (pix_frame_next) begin
+            // the last blank pixel of the frame that is ending: close it
+            frames_played = frames_played + 1;
+            if (skipped) begin
+                $display("  frame %0d: realigning", frames_played);
+            end else if (shown_in_frame == 0) begin
+                $display("  frame %0d: pattern", frames_played);
+            end else if (shown_in_frame != FRAME_PIX) begin
+                $display("  FAIL: the picture took the screen part way through frame %0d (%0d of %0d pixels)",
+                         frames_played, shown_in_frame, FRAME_PIX);
                 errors = errors + 1;
-                $display("  FAIL: row %0d col %0d got %h, expected %h",
-                         line, col, pix_rgb, expect_rgb(line, col));
-            end
-            if (col == PIXELS - 1) begin
-                col  = 0;
-                line = line + 1;
             end else begin
-                col = col + 1;
+                shown_frames = shown_frames + 1;
+                if ((bad_in_frame == 0) && (miss_in_frame == 0)) begin
+                    clean_frames = clean_frames + 1;
+                    $display("  frame %0d: picture, every pixel in place", frames_played);
+                end else begin
+                    $display("  FAIL: frame %0d was shown but %0d pixels were wrong and %0d missing",
+                             frames_played, bad_in_frame, miss_in_frame);
+                    errors = errors + 1;
+                end
             end
+            dpos           = 0;
+            shown_in_frame = 0;
+            bad_in_frame   = 0;
+            miss_in_frame  = 0;
+            skipped        = 1'b0;
+        end else if (pix_de) begin
+            if (show) begin
+                shown_in_frame = shown_in_frame + 1;
+                if (dpos >= FRAME_PIX) begin
+                    $display("  FAIL: the display frame is longer than this testbench plays");
+                    errors = errors + 1;
+                end else if (!pix_valid) begin
+                    miss_in_frame = miss_in_frame + 1;
+                end else if (pix_rgb !== expect_pos(dpos)) begin
+                    if (bad_in_frame < 4)
+                        $display("  FAIL: display position %0d (row %0d col %0d) shows %h, expected %h",
+                                 dpos, dpos / PIXELS, dpos % PIXELS, pix_rgb, expect_pos(dpos));
+                    bad_in_frame = bad_in_frame + 1;
+                    errors = errors + 1;
+                end
+            end
+            if (dut.align_wait)
+                skipped = 1'b1;
+            dpos = dpos + 1;
         end
     end
 
@@ -193,36 +346,62 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         end
     endtask
 
-    // Play one frame of video.  The reader hands out *one byte per pixel
-    // clock*, and a pixel is three bytes, so a line of PIXELS pixels takes
-    // PIXELS*3 pixel clocks, with a small blanking gap between lines.
-    task play_frame;
+    // Play the display: the blanking pixel that says the next pixel clock starts
+    // a frame, then a line of active pixels and the blank gap after it.  (The
+    // reader hands out one byte per pixel clock and a pixel is three bytes, so
+    // the shifter is what turns those bytes into one pixel per active clock; the
+    // timing here only has to look like the real thing in that the frame boundary
+    // arrives in the blanking, one clock before the first active pixel.)
+    task frame_boundary;
         begin
-            for (i = 0; i < ROWS; i = i + 1) begin
-                for (c = 0; c < PIXELS; c = c + 1) begin
-                    @(negedge pix_clk);
-                    pix_de = 1'b1;
-                end
-                @(negedge pix_clk);
-                pix_de = 1'b0;
-                repeat (4) @(negedge pix_clk);
-            end
+            @(negedge pix_clk);
+            pix_frame_next = 1'b1;
+            @(negedge pix_clk);
+            pix_frame_next = 1'b0;
         end
     endtask
 
-    integer errors_before;
-    integer base_a, base_b;
+    task play_line;
+        begin
+            for (c = 0; c < PIXELS; c = c + 1) begin
+                @(negedge pix_clk);
+                pix_de = 1'b1;
+            end
+            @(negedge pix_clk);
+            pix_de = 1'b0;
+            repeat (BLANK) @(negedge pix_clk);
+        end
+    endtask
+
+    task play_frame;
+        begin
+            frame_boundary;
+            for (i = 0; i < ROWS; i = i + 1)
+                play_line;
+        end
+    endtask
+
+    // A restart that is not a load, i.e. what M6 will do when it switches
+    // picture: the reader's `restart` is a toggle, so this is one memory clock
+    // wide.
+    task pulse_restart;
+        begin
+            @(negedge clk);
+            sw_restart = 1'b1;
+            @(negedge clk);
+            sw_restart = 1'b0;
+        end
+    endtask
 
     initial begin
-        errors    = 0;
-        rst       = 1'b1;
-        pix_rst   = 1'b1;
-        base_word = 21'd0;
-        active    = 1'b0;
-        pix_de    = 1'b0;
-        line      = 0;
-        col       = 0;
-        marker_q  = 8'h00;
+        errors         = 0;
+        rst            = 1'b1;
+        pix_rst        = 1'b1;
+        base_word      = 21'd0;
+        loaded         = 1'b0;
+        sw_restart     = 1'b0;
+        pix_de         = 1'b0;
+        pix_frame_next = 1'b0;
 
         repeat (4) @(posedge clk);
         repeat (4) @(posedge pix_clk);
@@ -235,43 +414,76 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         fill_frame(base_a, 0);
         fill_frame(base_b, 8'h40);              // a visibly different picture
 
-        // ---- 1. one frame, in order, flipped, RGB -----------------------
-        errors_before = errors;
-        line = 0;
-        col  = 0;
-        marker_q  = 8'h00;
+        // ---- 1. the picture becomes the source part way through a frame ----
+        // That is the condition which used to leave it offset: `loaded` rises in
+        // the middle of a display frame, exactly as it does on the board when the
+        // load finishes, and only the reader's own realignment can make the
+        // picture line up from there.  The frames played here are also test 2:
+        // the position check is what says the walk goes past exactly one picture
+        // per display frame, because if it did not, the frames after the first
+        // one would be out of place.
         base_word = base_a;
-        active    = 1'b1;
-        repeat (2000) @(posedge clk);       // let the reader prime the buffer
-        play_frame;
-        repeat (10) @(posedge pix_clk);
-        if (line !== ROWS) begin
-            $display("  FAIL: handed out %0d lines (expected %0d), underruns %0d",
-                     line, ROWS, pix_underrun);
-            errors = errors + 1;
+        play_frame;                     // a frame of pattern
+        frame_boundary;                 // ... and part way into the next one
+        play_line;
+        repeat (PIXELS / 2) begin
+            @(negedge pix_clk);
+            pix_de = 1'b1;
         end
+        loaded = 1'b1;
+        @(negedge pix_clk);
+        pix_de = 1'b0;
+        repeat (4) play_frame;
+
+        if (shown_frames < 2) begin
+            $display("  FAIL: the picture reached the screen only %0d times in those frames",
+                     shown_frames);
+            errors = errors + 1;
+        end else if (clean_frames < shown_frames) begin
+            $display("  FAIL: %0d of %0d shown frames were not the picture, in place",
+                     shown_frames - clean_frames, shown_frames);
+            errors = errors + 1;
+        end else begin
+            $display("  takeover     : PASS (%0d frames shown, all in place, from each frame's first pixel)",
+                     clean_frames);
+        end
+
         if (pix_underrun !== 16'd0) begin
             $display("  FAIL: %0d pixel underruns", pix_underrun);
             errors = errors + 1;
         end
-        $display("  [state] lines=%0d fetched=%0d buffered=%0d state=%0d flushed=%0d",
-                 line, words_fetched, dut.u_word_fifo.wused, dut.mstate,
-                 dut.dbg_flush_words);
-        if (errors == errors_before)
-            $display("  picture A    : PASS (%0d pixels, rows flipped, R,G,B order)",
-                     ROWS * PIXELS);
 
-        // ---- 2. switching picture: the next fetch must be the new one ----
+        // ---- 2. a restart in the middle of a frame re-aligns it again ------
+        // Wherever it lands, the picture has to be back on the screen in place
+        // within a couple of frames: that is what M6's picture switch will need.
+        for (r = 0; r < 3; r = r + 1) begin
+            errors_before = errors;
+            clean_before  = clean_frames;
+            shown_before  = shown_frames;
+            repeat (3 + 11 * r) @(negedge pix_clk);  // land it at a different
+            pulse_restart;                           // point in the frame each time
+            repeat (5) play_frame;
+            if ((clean_frames - clean_before) < 2) begin
+                $display("  FAIL: restart %0d: %0d clean frames after it (%0d shown)",
+                         r, clean_frames - clean_before, shown_frames - shown_before);
+                errors = errors + 1;
+            end else begin
+                $display("  restart %0d    : PASS (realigned, %0d clean frames in the 5 that followed)",
+                         r, clean_frames - clean_before);
+            end
+        end
+
+        // ---- 3. switching picture: the next fetch must be the new one ------
         // Checked at the memory side, which is where it matters: after a base
         // change the very next fetch has to come from the new picture's last
-        // row, not from wherever the old walk had got to.  (The display side
-        // is only expected to be mid-frame during a switch when the top level
+        // row, not from wherever the old walk had got to.  (The display side is
+        // only expected to be mid-frame during a switch when the top level
         // switches at a frame boundary, which M6 does.)
         errors_before = errors;
-        active    = 1'b0;
-        repeat (2000) @(posedge clk);       // let the reader settle to idle
+        loaded    = 1'b0;
+        repeat (200) @(posedge clk);        // let the reader settle to idle
         base_word = base_b;
-        active    = 1'b1;                   // ... and let it read the new one
+        loaded    = 1'b1;                   // ... and let it read the new one
         // wait for a request and look at where it points
         k = 0;
         while (!rd_br_req && (k < 20000)) begin
@@ -289,13 +501,13 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
             // to the display as if they belonged to the new one
             fail("the switch did not flush the old picture out of the buffer");
         end else begin
-            $display("  switch       : PASS (flushed %0d stale bytes, next fetch is the new row)",
+            $display("  switch       : PASS (flushed %0d stale bytes, the next fetch is the new row)",
                      dut.dbg_flush_words);
         end
 
-        // ---- 3. not the active source: fetching stops -------------------
+        // ---- 4. not the active source: fetching stops ----------------------
         errors_before = errors;
-        active = 1'b0;
+        loaded = 1'b0;
         repeat (400) @(posedge clk);
         count_fetched_before = words_fetched;
         repeat (4000) @(posedge clk);
@@ -307,7 +519,7 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         if (errors == errors_before)
             $display("  idle         : PASS (no fetching while the frame is unused)");
 
-        // ---- 4. the memory model saw nothing illegal --------------------
+        // ---- 5. the memory model saw nothing illegal -----------------------
         if (u_ctrl.u_sdram.errors !== 0) begin
             $display("  FAIL: the SDRAM model reported %0d protocol violations",
                      u_ctrl.u_sdram.errors);
@@ -315,6 +527,10 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         end else begin
             $display("  protocol     : PASS");
         end
+
+        $display("  [state] frames=%0d shown=%0d clean=%0d fetched=%0d buffered=%0d underruns=%0d",
+                 frames_played, shown_frames, clean_frames, words_fetched,
+                 dut.u_word_fifo.wused, pix_underrun);
 
         if (errors == 0)
             $display("RESULT: PASS -- frame read path verified");

@@ -113,7 +113,14 @@ module tb_sdram_selftest;
         .ok_burst    (st_ok_burst),
         .shift_burst (st_shift_burst),
         .adj_burst   (st_adj_burst),
-        .top_burst   (st_top_burst)
+        .top_burst   (st_top_burst),
+        // The probe asks whether the picture has landed before it settles into
+        // holding its answer.  There is no picture in this testbench, and the
+        // probe *compares* this input to pick its next state: leaving it
+        // unconnected made it a floating z, the comparison came out unknown and
+        // the state machine went with it, so the sweep never finished.  (The
+        // real top level drives it.)
+        .pic_go      (1'b0)
     );
 
     initial begin

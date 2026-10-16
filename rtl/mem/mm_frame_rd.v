@@ -21,6 +21,23 @@
 //     side*, because the read pointer lives in the pixel clock domain: the
 //     memory side stops, asks, waits for the acknowledgement, and only then
 //     starts the walk on the new picture
+//   * and where the walk *starts* has to be a display frame boundary, or the
+//     picture never lines up with the screen.  One pixel leaves the shifter per
+//     active pixel clock, so the walk is slaved to the display; a walk let go in
+//     the middle of a frame puts the picture's first line in the middle of a
+//     display line and every picture row a fraction of a line lower, by an
+//     amount that depends on how full the buffer was at that instant -- which is
+//     why the offset was a different one, in a different direction, after every
+//     reset.  A switch therefore blocks the pixel side until the next frame
+//     boundary and lets the buffer fill in the frame in between.  A display
+//     frame is 640 x 480 pixels and so is the picture, so a walk that starts on
+//     a boundary stays on one: exactly one picture goes past per frame.
+//
+// `restart` is that same sequence asked for from outside: a toggle that re-arms
+// the walk on the picture's first word and blocks the pixel side until the next
+// frame boundary.  The top level pulses it when a loaded picture becomes the
+// source, so the takeover lands on an aligned frame instead of wherever the free
+// running walk happened to be.
 //
 // Why the bytes are regrouped on the pixel side: a word is four bytes and a
 // pixel is three, so they never line up.  On this side there is one clock per
@@ -57,6 +74,9 @@ module mm_frame_rd #(
     input  wire        rst,
     input  wire [20:0] base_word,
     input  wire        active,
+    input  wire        restart,             // toggle: re-arm the walk on the
+                                            // picture's first word and start it
+                                            // on the next frame boundary
     output reg         br_req,
     output reg  [20:0] br_addr,
     output reg  [8:0]  br_len,
@@ -80,12 +100,13 @@ module mm_frame_rd #(
     output wire [8:0]  dbg_used,            // words in the word buffer
     output wire        dbg_app_ok,          // there is room for a whole run
     output wire [1:0]  dbg_mstate,          // M_IDLE / M_BURST / M_FLUSH
-    output wire        pix_ready,           // buffer primed: safe to unmask
+    output wire        pix_ready,           // primed since the restart: unmask
 
     // pixel side, 25 MHz
     input  wire        pix_clk,
     input  wire        pix_rst,
     input  wire        pix_de,              // active pixel: present one pixel
+    input  wire        pix_frame_next,      // last blanking pixel of the frame
     output wire [23:0] pix_rgb,
     output wire        pix_valid,           // this active clock carries a pixel
     output reg  [15:0] pix_underrun,        // saturating, for diagnostics
@@ -129,6 +150,8 @@ module mm_frame_rd #(
     reg         resync;             // tells the pixel side to realign
     reg         ack_ref;            // flush_done as it was when the switch began
     reg         fd_s1, fd_s2;
+    reg         rr_s1, rr_s2;
+    wire        restart_pulse = rr_s2 ^ rr_s1;
 
     // A run is a fixed length, cut short by the end of the picture row and by
     // the end of the SDRAM device row.  Working the length out from the free
@@ -165,7 +188,31 @@ module mm_frame_rd #(
     wire        can_burst  = !br_busy && app_ok && (burst_len != 9'd0);
     wire        flush_done_s = fd_s2;
 
-    assign pix_ready = (fifo_used >= (FIFO_DEPTH / 2));
+    // "Safe to unmask" is more than "there are words in the buffer": the walk has
+    // to have been restarted and the buffer filled since, so that the picture's
+    // first pixel is the next pixel the pixel side hands out, on the coming frame
+    // boundary.  The top level waits for this before it puts the picture on the
+    // screen, which is what makes the takeover land on an aligned frame instead
+    // of one pixel out and one line short.
+    //
+    // Latched, not the instantaneous level.  The buffer is refilled in bursts
+    // once it has drained to half, so in the steady state its level sits *around*
+    // half and the low point of every refill cycle reaches the threshold: a frame
+    // boundary that fell in a refill gap would read "not primed" and take the
+    // picture off the screen for a whole frame.  What is being asked is "has it
+    // been primed since the walk was restarted", so the answer is latched, and a
+    // restart clears it.
+    reg         primed;
+    wire        arm_w = (base_word != base_q) || restart_pulse;
+
+    always @(posedge clk) begin
+        if (rst) primed <= 1'b0;
+        else if (arm_w) primed <= 1'b0;
+        else if ((mstate != M_FLUSH) && (fifo_used >= (FIFO_DEPTH / 2)))
+            primed <= 1'b1;
+    end
+
+    assign pix_ready = primed;
     assign dbg_used   = fifo_used;
     assign dbg_app_ok = app_ok;
     assign dbg_mstate = mstate;
@@ -192,9 +239,15 @@ module mm_frame_rd #(
             fifo_winc <= 1'b0;
 
             // A change of picture always wins: with the buffer full and nobody
-            // consuming it would otherwise never see the new base at all.
-            if (base_word != base_q) begin
-                base_q        <= base_word;
+            // consuming it would otherwise never see the new base at all.  A
+            // restart asks for the same thing, which is why it is the same arm --
+            // the walk goes back to the picture's first word and the pixel side
+            // is told to throw its buffer away and wait for a frame boundary.
+            // base_q only follows base_word when the base really changed, or a
+            // restart would look like a second picture switch.
+            if (arm_w) begin
+                if (base_word != base_q)
+                    base_q    <= base_word;
                 row_ptr       <= ROWS - 1;
                 row_base      <= base_word + LAST_ROW_OFFSET;
                 col_ptr       <= 18'd0;
@@ -281,6 +334,20 @@ module mm_frame_rd #(
         end
     end
 
+    // The restart toggle, and the edge it makes.  Two flops even though the top
+    // level generates it in this clock domain: the input is a level, the edge is
+    // what the arm above reacts to, and nothing here should assume where the
+    // toggle comes from.
+    always @(posedge clk) begin
+        if (rst) begin
+            rr_s1 <= 1'b0;
+            rr_s2 <= 1'b0;
+        end else begin
+            rr_s1 <= restart;
+            rr_s2 <= rr_s1;
+        end
+    end
+
     mm_afifo #(
         .DW (32),
         .AW (FIFO_AW)
@@ -320,6 +387,7 @@ module mm_frame_rd #(
     reg         flushing;           // emptying the buffer of the old picture
     reg         flush_done_r;       // toggle: the old picture has gone
     reg  [31:0] flush_words;        // how many old words were thrown away
+    reg         align_wait;         // blocked until the display's frame boundary
 
     assign dbg_flush_words = flush_words;
     assign flush_done      = flush_done_r;
@@ -344,7 +412,12 @@ module mm_frame_rd #(
 
     wire        can_topup  = !flushing && !fifo_empty && (hcnt <= 4'd6);
     wire        have_pixel = (hcnt >= 4'd3);
-    wire        take_byte  = pix_de && have_pixel && !flushing;
+    // The frame boundary the blocked pixel side is waiting for.  Priming is
+    // allowed to carry on (can_topup does not look at align_wait), which is the
+    // point: the buffer is meant to be full by the time the boundary comes, so
+    // the first line of the picture comes out complete.
+    wire        align_now  = pix_frame_next && !flushing && have_pixel;
+    wire        take_byte  = pix_de && have_pixel && !flushing && !align_wait;
 
     // one combined decision, so `hold` has a single driver
     wire [95:0] hold_next  = can_topup ? (appended >> (take_byte ? 24 : 0))
@@ -366,12 +439,20 @@ module mm_frame_rd #(
     // Only this side can do it, because the read pointer is here.  The memory
     // side asked (resync) and will not write again until it sees flush_done, so
     // nothing of the new picture can be thrown away by mistake.
+    //
+    // The drain is followed by the wait for a frame boundary, and the two are
+    // deliberately separate: draining with the FIFO's pop signal while the
+    // boundary is awaited would keep the buffer empty for ever.  While
+    // align_wait is set the shifter is filled as usual but nothing is handed
+    // out, so the picture starts on the frame's first pixel with its first line
+    // already in hand.
     //------------------------------------------------------------------
     always @(posedge pix_clk) begin
         if (pix_rst) begin
             flushing     <= 1'b0;
             flush_done_r <= 1'b0;
             flush_words  <= 32'd0;
+            align_wait   <= 1'b0;
         end else if (flushing) begin
             if (!fifo_empty)
                 flush_words <= flush_words + 32'd1;
@@ -382,6 +463,10 @@ module mm_frame_rd #(
         end else if (resync_pulse) begin
             flushing    <= 1'b1;
             flush_words <= 32'd0;
+            align_wait  <= 1'b1;
+        end else if (align_wait && align_now) begin
+            // the walk starts on the boundary that follows this cycle
+            align_wait <= 1'b0;
         end
     end
 
@@ -414,9 +499,12 @@ module mm_frame_rd #(
             hcnt <= hcnt_next;
             if (take_byte) begin
                 last_rgb <= rgb_now;
-            end else if (pix_de && (pix_underrun != 16'hFFFF)) begin
+            end else if (pix_de && !flushing && !align_wait && (pix_underrun != 16'hFFFF)) begin
                 // an active pixel with nothing to show: hold the last one and
-                // count it, so a starved stream is visible in the diagnostics
+                // count it, so a starved stream is visible in the diagnostics.
+                // The flush and the wait for the frame boundary are left out:
+                // neither has a picture on screen to starve, and counting them
+                // would saturate the meter and hide a real starvation.
                 pix_underrun <= pix_underrun + 16'd1;
             end
         end

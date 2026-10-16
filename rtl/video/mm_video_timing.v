@@ -32,6 +32,7 @@ module mm_video_timing #(
     output reg         vs,           // vertical sync,   active low
     output wire        de,           // data enable / active pixel
     output wire        frame_first,  // first active pixel of a frame
+    output wire        frame_next,   // the cycle before it: last blanking pixel
     output wire        line_last     // last active pixel of a line
 );
 
@@ -67,6 +68,15 @@ module mm_video_timing #(
     assign de          = (h_cnt < H_ACTIVE) && (v_cnt < V_ACTIVE);
     assign frame_first = de && (h_cnt == 12'd0) && (v_cnt == 11'd0);
     assign line_last   = de && (h_cnt == H_ACTIVE - 1);
+
+    // The last blanking pixel of the frame, i.e. the cycle in which the next
+    // pixel clock is the frame's first active one.  A consumer that has to have
+    // something *ready* on that first active pixel cannot use frame_first: a
+    // decision it registers in that cycle only takes effect on the cycle after,
+    // which leaves the frame's first pixel showing whatever was there before.
+    // Both the picture mux in the top level and the frame reader's start of a
+    // picture have to be settled before the boundary, so they use this.
+    assign frame_next  = (h_cnt == H_TOTAL - 1) && (v_cnt == V_TOTAL - 1);
 
 endmodule
 
