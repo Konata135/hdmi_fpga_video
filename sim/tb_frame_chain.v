@@ -48,6 +48,8 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
     always #20 pix_clk  = ~pix_clk;     // 25 MHz, the display side
 
     integer errors = 0, i, k;
+    integer clean_before = 0;
+    integer loads_done = 0;
     integer frames_played = 0;
     integer shown_frames  = 0;      // frames the picture was on the screen for,
                                     // end to end
@@ -126,6 +128,7 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
     reg [7:0]  p_lat;
     reg [2:0]  p_bit;               // which bit of the current byte
     reg        ld_start;
+    reg  [20:0] fd_base = 21'd0;    // which slot the loader is filling
 
     wire [31:0] ld_rd_lba_w;
     wire        ld_rd_start;
@@ -189,6 +192,10 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
     wire [31:0] br_data;
 
     wire        ld_busy, ld_done;
+    // ld_done is one clock wide and lives in the 50 MHz domain, while the
+    // sequencer below waits from the 62.5 MHz one, so it waits on this count
+    // rather than on the pulse itself.
+    always @(posedge clk_byte) if (ld_done) loads_done = loads_done + 1;
     wire [3:0]  ld_error, ld_phase;
     wire [31:0] ld_bytes_sent;
     wire [15:0] ld_sectors_read;
@@ -282,7 +289,7 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
         .start_lba    (START_LBA),
         .file_bytes   (FILE_BYTES[31:0]),
         .entry_valid  (1'b1),
-        .frame_base   (21'd0),      // slot 0: what the board puts picture 0 in
+        .frame_base   (fd_base),    // slot 0 first, slot 1 for the second load
         .rd_lba       (ld_rd_lba_w),
         .rd_start     (ld_rd_start),
         .rd_busy      (p_busy),
@@ -490,7 +497,7 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
         ld_start = 1'b0;
 
         k = 0;
-        while (!ld_done && (k < 4000000)) begin
+        while ((loads_done < 1) && (k < 4000000)) begin
             @(posedge clk125);
             k = k + 1;
         end
@@ -524,6 +531,33 @@ always #8  clk_sft  = ~clk_sft;     // 62.5 MHz, 180 degrees, device side
             // a second frame can show whether that holds.
             repeat (3) play_frame;
             repeat (BLANK_PX) @(posedge pix_clk);
+
+            // ---- a second picture, loaded behind the first ---------------
+            // This is what the carousel does on the board: while slot 0 is on
+            // the screen, the loader fills slot 1 through the write port while
+            // the reader keeps fetching through the burst port.  The picture on
+            // screen must not notice at all -- same pixels in the same places,
+            // no underrun, and no lost word (a word handed to the reader but
+            // dropped shifts the 3-byte pixel phase for the rest of the frame).
+            clean_before = clean_frames;
+            fd_base  = 21'd230400;                  // slot 1
+            @(negedge clk_byte);
+            ld_start = 1'b1;
+            @(negedge clk_byte);
+            ld_start = 1'b0;
+            repeat (12) play_frame;                 // the load takes ~5 frames
+
+            if (loads_done != 2) begin
+                $display("  FAIL: %0d loads finished, expected 2", loads_done);
+                errors = errors + 1;
+            end else if (clean_frames - clean_before < 8) begin
+                $display("  FAIL: only %0d of the 12 frames behind the load came out right",
+                         clean_frames - clean_before);
+                errors = errors + 1;
+            end else begin
+                $display("  behind       : PASS (slot 1 loaded while slot 0 was on screen, %0d frames undisturbed)",
+                         clean_frames - clean_before);
+            end
 
             if (clean_frames < 2) begin
                 $display("  FAIL: %0d frames came out as the picture, in place (expected 2)",

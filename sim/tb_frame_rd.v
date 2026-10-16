@@ -43,8 +43,10 @@
 //  3. a restart in the middle of a frame re-aligns it again, three times, landing
 //     at a different point in the frame each time
 //  4. switching to another frame at another base reads that frame
-//  5. with `active` low the reader stops fetching
-//  6. the SDRAM model saw no protocol violation
+//  5. the sequence the top level uses on a switch -- the base change and the
+//     restart toggle, together -- leaves it walking on the new picture
+//  6. with `active` low the reader stops fetching
+//  7. the SDRAM model saw no protocol violation
 //=============================================================================
 `timescale 1ns / 100ps
 
@@ -137,7 +139,11 @@ module tb_frame_rd;
     initial pix_clk  = 1'b0;
 always #8  clk     = ~clk;              // 62.5 MHz memory side
 always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
-    always #20 pix_clk = ~pix_clk;          // 25 MHz pixel side
+    // The two clocks are deliberately not phase-aligned: the handshakes here are
+    // pulses a few nanoseconds wide crossing between them, and whether a
+    // sampling edge lands inside one is a phase question.  Having them start
+    // together is the easy case, so the pixel clock starts half a period late.
+    always begin #10; forever #20 pix_clk = ~pix_clk; end   // 25 MHz, offset
 
     // what a stored byte should be
     function [7:0] stored_byte;
@@ -505,7 +511,36 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
                      dut.dbg_flush_words);
         end
 
-        // ---- 4. not the active source: fetching stops ----------------------
+        // ---- 4. the switch sequence the top level actually uses -------------
+        // A switch changes the base *and* toggles `restart` in the same cycle,
+        // so this module is armed once and has to come back up on the new
+        // picture: re-point the walk, drain, refill and hand out pixels again.
+        // (This is also the sequence that would break it if the two ever became
+        // two separate arms: the second `resync` toggle would cancel the first
+        // inside the pixel side's synchroniser and the reader would sit in
+        // M_FLUSH for ever -- see the note in mm_frame_rd.)
+        errors_before = errors;
+        clean_before  = clean_frames;
+        shown_before  = shown_frames;
+        loaded        = 1'b0;
+        repeat (200) @(posedge clk);        // let it settle
+        @(negedge clk);
+        base_word  = base_a;                // the base change ...
+        sw_restart = 1'b1;                  // ... and the restart, together
+        loaded     = 1'b1;
+        @(negedge clk);
+        sw_restart = 1'b0;
+        repeat (4) play_frame;
+        if ((clean_frames - clean_before) < 2) begin
+            $display("  FAIL: a base change and a restart a clock apart left the reader stuck (%0d clean frames)",
+                     clean_frames - clean_before);
+            errors = errors + 1;
+        end else begin
+            $display("  arm pair     : PASS (%0d clean frames after the base change and the restart)",
+                     clean_frames - clean_before);
+        end
+
+        // ---- 5. not the active source: fetching stops ----------------------
         errors_before = errors;
         loaded = 1'b0;
         repeat (400) @(posedge clk);
@@ -519,7 +554,7 @@ always #8  clk_sft = ~clk_sft;          // ... 180 degrees, to the device
         if (errors == errors_before)
             $display("  idle         : PASS (no fetching while the frame is unused)");
 
-        // ---- 5. the memory model saw nothing illegal -----------------------
+        // ---- 6. the memory model saw nothing illegal -----------------------
         if (u_ctrl.u_sdram.errors !== 0) begin
             $display("  FAIL: the SDRAM model reported %0d protocol violations",
                      u_ctrl.u_sdram.errors);

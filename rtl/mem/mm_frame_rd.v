@@ -253,9 +253,20 @@ module mm_frame_rd #(
                 col_ptr       <= 18'd0;
                 br_left       <= 9'd0;
                 words_fetched <= 32'd0;
-                resync        <= ~resync;
-                ack_ref       <= flush_done_s;   // the drain we are about to ask for
-                mstate        <= M_FLUSH;
+                // One drain at a time.  Two arms close together are harmless
+                // today (the base change and the restart toggle arrive in the
+                // same cycle, so `arm_w` is true once), but if anything ever
+                // arms this again while a drain is in flight, the second
+                // `resync` toggle lands inside the pixel side's two-flop
+                // synchroniser and the pair cancels out: the pixel side would
+                // never see a request, never drain, never acknowledge, and this
+                // side would sit in M_FLUSH for ever with the buffer never
+                // refilling -- the screen drops back to the pattern and stays
+                // there.  Re-pointing the walk is all a second arm needs to do;
+                // the drain already in flight throws the old bytes away anyway.
+                resync  <= ~resync;
+                ack_ref <= flush_done_s;
+                mstate  <= M_FLUSH;
             end else case (mstate)
                 M_IDLE: begin
                     // the burst port wants the request in a ready cycle, one

@@ -262,6 +262,14 @@ module top (
     reg         sw_pending;
     reg         dt_s1, dt_s2, dt_prev;
     reg         vb_s1, vb_s2;
+    // The rescue line (see the block before the frame reader): the reader can be
+    // restarted on its own, without touching the controller or the loader.
+    reg         rd_rescue;
+    reg  [2:0]  rescue_hold;
+    reg  [1:0]  fail_frames;
+    reg         fail_latch;
+    reg  [3:0]  fail_state, fail_used, rescues;
+    wire        rd_rst = mem_rst | rd_rescue;
     wire [15:0] rd_rows_seen;       // reader diagnostic: stored rows walked
     wire [8:0]  rd_used;            // reader diagnostic: words in its buffer
     wire        rd_app_ok;          // ... room for a whole run
@@ -673,7 +681,7 @@ module top (
     // the picture's; see mm_frame_rd's header.
     mm_frame_rd u_frame_rd (
         .clk            (mem_clk),
-        .rst            (mem_rst),
+        .rst            (rd_rst),
         .base_word      (base_m),           // whichever slot is on screen
         .active         (frame_active),
         .restart        (rd_restart),
@@ -799,6 +807,69 @@ module top (
 
     // the reader only ever fetches from a slot the scheduler vouched for
     assign frame_active = slot_ready_m;
+
+    //------------------------------------------------------------------
+    // the reader's rescue line
+    //
+    // A switch can leave the reader unprimed -- the picture falls back to the
+    // pattern -- and on the board it stayed there for the rest of the session.
+    // That handshake failure has not been reproducible in simulation (the whole
+    // suite, including concurrent loading into the next slot and the exact
+    // sequence the top level uses to switch, comes out clean), so this does two
+    // things instead of guessing: it catches the reader's state at the moment it
+    // failed, so the next occurrence says *why* rather than only that it
+    // happened, and it restarts the reader -- its own reset, not the
+    // controller's, so the frame store and the picture on it are untouched --
+    // which puts the picture back a few frames later instead of never.
+    //
+    // The threshold is four frames: a switch normally has the walk running again
+    // within a few microseconds, so anything still unprimed a frame later is not
+    // a slow refill, it is a stuck one.
+    //------------------------------------------------------------------
+    wire primed_m    = rd_pix_ready;
+    wire vblank_rise = vb_s1 & ~vb_s2;
+
+    always @(posedge mem_clk) begin
+        if (mem_rst) begin
+            fail_frames <= 2'd0;
+            fail_latch  <= 1'b0;
+            fail_state  <= 4'd0;
+            fail_used   <= 4'd0;
+            rescues     <= 4'd0;
+            rd_rescue   <= 1'b0;
+            rescue_hold <= 3'd0;
+        end else begin
+            rd_rescue <= 1'b0;
+
+            if (vblank_rise) begin
+                if (slot_ready_m && !primed_m) begin
+                    if (fail_frames == 2'd3) begin
+                        if (!fail_latch) begin
+                            // what the reader was doing when it gave up: this
+                            // nibble tells a stuck drain (2), a fetch that never
+                            // started (0 with app_ok) and a burst that never
+                            // finished (1 with br_busy) apart
+                            fail_state  <= {rd_mstate, rd_app_ok, br_busy};
+                            fail_used   <= rd_used[8:5];
+                            fail_latch  <= 1'b1;
+                            rescues     <= rescues + 4'd1;
+                            rescue_hold <= 3'd6;
+                        end
+                    end else begin
+                        fail_frames <= fail_frames + 2'd1;
+                    end
+                end else begin
+                    fail_frames <= 2'd0;
+                    fail_latch  <= 1'b0;        // it primed again: all is well
+                end
+            end
+
+            if (rescue_hold != 3'd0) begin
+                rd_rescue   <= 1'b1;
+                rescue_hold <= rescue_hold - 3'd1;
+            end
+        end
+    end
 
     // The probe's picture check starts when the picture is on screen.  The wire
     // itself is declared up at the probe (it has to be: a name used before its
@@ -1023,10 +1094,10 @@ module top (
             page     <= 4'd0;
         end else if (page_cnt == 27'd99_999_999) begin
             page_cnt <= 27'd0;
-            // page 16 is retired (see the page table): step over it.  Page 15 is
-            // the carousel's own page now, so it stays in the rotation.
+            // pages 15 and 16 are the carousel's own page and the reader's rescue
+            // page now, so the rotation steps over nothing any more
             page     <= (page == 4'd14)     ? 5'd15 :
-                        (page == 4'd15)     ? 5'd17 :
+                        (page == 4'd15)     ? 5'd16 :
                         (page == PAGE_LAST) ? 5'd0  :
                                               (page + 5'd1);
         end else begin
@@ -1177,6 +1248,17 @@ module top (
                 pg_hi  = {1'b0, disp_sel};
                 pg_mid = loaded_count;
                 pg_lo  = {3'b000, auto_on};
+            end
+            // Page 16 is the reader's rescue line (see the block before the frame
+            // reader): d4 d3 are the state it was found in the last time it
+            // stopped priming -- d4 = {mstate, app_ok, br_busy} (mstate 0 = idle,
+            // 1 = waiting for burst words, 2 = draining), d3 = its word buffer
+            // usage /16 -- and d2 counts how many times it has had to be
+            // restarted.  All zero means it has never happened in this session.
+            5'd16: begin
+                pg_hi  = fail_state;
+                pg_mid = fail_used;
+                pg_lo  = rescues;
             end
             // Is that same stream as fresh as the reader says it is?  11A (282)
             // = every displayed pixel is a fresh picture pixel; much smaller =
