@@ -30,6 +30,14 @@ module top (
     // down/up = 2 s, down/down = 4 s (SW2 = C7 is the low bit)
     input  wire sw_period0,    // pin C7, SW2
     input  wire sw_period1,    // pin C6, SW3
+    // SW4 turns the audio path on.  It exists because the data island tables
+    // are still being sorted out: with it down the transmitter behaves exactly
+    // as it did before audio (see doc/路线图.md, M7).
+    input  wire sw_audio,      // pin C5, SW4
+
+    // the board's buzzer (H11); it is on the same note as the HDMI audio, so the
+    // tone source can be heard and checked before the data island exists
+    output wire buzzer,
 
     // HDMI type A on the HDMI_B connector
     output wire HDMI_CLK_P,
@@ -581,6 +589,7 @@ module top (
 
     reg [27:0] carou_period;
 
+
     always @(*) begin
         case ({sw_period1_level, sw_period0_level})
             2'b00:   carou_period = 28'd25_000_000;    // 0.5 s
@@ -618,6 +627,40 @@ module top (
         .loaded_count (loaded_count),
         .state_dbg    (sched_state)
     );
+
+    //------------------------------------------------------------------
+    // audio: the note source, and for now the buzzer that proves it
+    //
+    // The tone is the same one the HDMI data island will carry.  Until those
+    // tables are sorted out (doc/路线图.md, M7) the only audible path is the
+    // board's buzzer: SW4 (C5) up turns the audio on and, with the buzzer's own
+    // switch SW5 on the board, the note comes out of it.  This is not the HDMI
+    // audio the competition asks for; it is how the sample source gets checked.
+    //------------------------------------------------------------------
+    wire sw_audio_level;
+
+    mm_key_debounce u_sw_audio (
+        .clk   (clk),
+        .rst   (~por_n),
+        .raw   (sw_audio),
+        .level (sw_audio_level),
+        .press ()
+    );
+
+    wire        audio_sample_valid;
+    wire [23:0] audio_sample;
+
+    mm_audio_tone u_audio_tone (
+        .clk          (clk),
+        .rst          (~por_n),
+        .enable       (sw_audio_level),
+        .note_sel     (disp_sel[1:0]),
+        .sample_valid (audio_sample_valid),
+        .sample       (audio_sample)
+    );
+
+    // a square wave at the note, from the sample's sign
+    assign buzzer = sw_audio_level ? audio_sample[23] : 1'b0;
 
     // Slot i starts at i * 230400 words = (i * 225) << 10, and 225 is
     // 128 + 64 + 32 + 1: four shifts and three adders, no multiplier.

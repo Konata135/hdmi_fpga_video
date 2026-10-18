@@ -20,6 +20,8 @@ set_pin_assignment  { key_next } { LOCATION = B2; IOSTANDARD = LVCMOS33; PULLTYP
 set_pin_assignment  { sw_auto }  { LOCATION = C8; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
 set_pin_assignment  { sw_period0 } { LOCATION = C7; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
 set_pin_assignment  { sw_period1 } { LOCATION = C6; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment  { sw_audio }   { LOCATION = C5; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment  { buzzer }     { LOCATION = H11; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
 
 # ---- HDMI ------------------------------------------------------------------
 set_pin_assignment  { HDMI_CLK_P }   { LOCATION = C3; IOSTANDARD = LVDS33; PULLTYPE = NONE; }
