@@ -12,8 +12,10 @@
 //     the reader fetches through the burst port, which is what the controller's
 //     two ports are for).
 //   * a key press moves the screen on to the next *loaded* picture, and a
-//     switch turns a one-per-second automatic walk over the loaded ones on and
-//     off.  Both are the same step here: `disp_sel` walks the loaded set.
+//     switch turns an automatic walk over the loaded ones on and off, at the
+//     interval `carou_period` asks for (the board's two spare slide switches
+//     pick 0.5, 1, 2 or 4 seconds).  Both are the same step here: `disp_sel`
+//     walks the loaded set.
 //
 // A load that fails is retried a second later, up to MAX_TRIES times, and then
 // that slot is given up on and the others carry on: a bad picture costs one
@@ -28,8 +30,7 @@
 module mm_pic_sched #(
     parameter integer N_SLOTS         = 8,           // must be 8: the masks are 8 bit
     parameter integer RETRY_CYCLES    = 50_000_000,  // 1 s at 50 MHz
-    parameter integer MAX_TRIES       = 3,
-    parameter integer CAROUSEL_CYCLES = 50_000_000   // 1 s per picture
+    parameter integer MAX_TRIES       = 3
 )(
     input  wire        clk,
     input  wire        rst,
@@ -49,6 +50,9 @@ module mm_pic_sched #(
     // the controls
     input  wire        key_press,       // one cycle: show the next picture
     input  wire        auto_on,         // the switch, already debounced
+    // one automatic step every this many clocks (0.5 s .. 4 s at 50 MHz, so it
+    // needs 28 bits: four seconds is 200 million)
+    input  wire [27:0] carou_period,
 
     // what the screen should be showing
     output reg  [2:0]  disp_sel,
@@ -67,7 +71,6 @@ module mm_pic_sched #(
                      S_DONE  = 3'd5;    // nothing left to load
 
     localparam [20:0] RETRY = RETRY_CYCLES;
-    localparam [26:0] CAROU = CAROUSEL_CYCLES;
 
     reg  [7:0]  loaded;                 // slots with a picture in them
     reg  [7:0]  bad;                    // slots given up on
@@ -77,7 +80,8 @@ module mm_pic_sched #(
     reg  [1:0]  tries;
     reg  [20:0] retry_cnt;
     reg  [20:0] begun_cnt;              // how long a start has gone unanswered
-    reg  [26:0] carou_cnt;
+    reg  [27:0] carou_cnt;
+    reg  [27:0] carou_period_q;         // so a new setting starts a fresh interval
 
     assign state_dbg = {1'b0, state};
 
@@ -223,7 +227,7 @@ module mm_pic_sched #(
     //------------------------------------------------------------------
     wire [2:0] adv_to    = next_set(loaded, disp_sel + 3'd1);
     wire       can_adv   = (loaded != 8'd0) && (adv_to != disp_sel);
-    wire       carou_tick = (carou_cnt == CAROU);
+    wire       carou_tick = (carou_cnt == carou_period);
     wire       step_now  = can_adv && (key_press || (auto_on && carou_tick));
 
     always @(posedge clk) begin
@@ -231,10 +235,19 @@ module mm_pic_sched #(
             disp_sel  <= 3'd0;
             disp_tgl  <= 1'b0;
             carou_cnt <= 27'd0;
+            carou_period_q <= 28'd0;
             announced <= 1'b0;      // driven here and nowhere else
         end else begin
-            if (carou_tick)         carou_cnt <= 27'd0;
-            else if (auto_on)       carou_cnt <= carou_cnt + 27'd1;
+            if (carou_period != carou_period_q) begin
+                // a new setting starts a fresh interval rather than inheriting
+                // however far the old one had counted
+                carou_period_q <= carou_period;
+                carou_cnt      <= 28'd0;
+            end else if (carou_tick) begin
+                carou_cnt <= 28'd0;
+            end else if (auto_on) begin
+                carou_cnt <= carou_cnt + 28'd1;
+            end
 
             if ((loaded != 8'd0) && (!announced || !loaded[disp_sel])) begin
                 // The first picture to arrive takes the screen, and the top

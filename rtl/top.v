@@ -26,6 +26,10 @@ module top (
     // are free; SW1-SW4 are C8/C7/C6/C5 if a different one is wanted.
     input  wire key_next,      // pin B2, KEY2: next picture
     input  wire sw_auto,       // pin C8, SW1: up = carousel on
+    // SW2/SW3 pick the carousel interval: up/up = 0.5 s, up/down = 1 s,
+    // down/up = 2 s, down/down = 4 s (SW2 = C7 is the low bit)
+    input  wire sw_period0,    // pin C7, SW2
+    input  wire sw_period1,    // pin C6, SW3
 
     // HDMI type A on the HDMI_B connector
     output wire HDMI_CLK_P,
@@ -555,6 +559,37 @@ module top (
     // the switch is a level, and it is already debounced
     wire auto_on = sw_auto_level;
 
+    // The interval selectors.  Slide switches bounce like the rest, so they get
+    // the same filter, and the two levels make a four way choice.
+    wire sw_period0_level, sw_period1_level;
+
+    mm_key_debounce u_sw_period0 (
+        .clk   (clk),
+        .rst   (~por_n),
+        .raw   (sw_period0),
+        .level (sw_period0_level),
+        .press ()
+    );
+
+    mm_key_debounce u_sw_period1 (
+        .clk   (clk),
+        .rst   (~por_n),
+        .raw   (sw_period1),
+        .level (sw_period1_level),
+        .press ()
+    );
+
+    reg [27:0] carou_period;
+
+    always @(*) begin
+        case ({sw_period1_level, sw_period0_level})
+            2'b00:   carou_period = 28'd25_000_000;    // 0.5 s
+            2'b01:   carou_period = 28'd50_000_000;    // 1 s
+            2'b10:   carou_period = 28'd100_000_000;   // 2 s
+            default: carou_period = 28'd200_000_000;   // 4 s
+        endcase
+    end
+
     wire [2:0] sched_tbl_index;
     wire [2:0] disp_sel;
     wire       disp_tgl;
@@ -577,6 +612,7 @@ module top (
         .load_phase   (ld_phase),
         .key_press    (key_next_press),
         .auto_on      (auto_on),
+        .carou_period (carou_period),
         .disp_sel     (disp_sel),
         .disp_tgl     (disp_tgl),
         .loaded_count (loaded_count),
@@ -1246,13 +1282,15 @@ module top (
             // numbers so nothing else had to be renumbered.
             //
             // The carousel: which picture is on screen (d4), how many pictures
-            // are in their slots (d3), and whether the switch is up (d2, 1/0).
-            // d4 sitting still while the switch is up means either only one
-            // picture loaded or the switch is off; a key press should walk it.
+            // are in their slots (d3), and d2 = {SW1, SW2, SW3, 0}: the top bit
+            // says the walk is running, and the two below are the interval
+            // (00 = 0.5 s, 01 = 1 s, 10 = 2 s, 11 = 4 s).  So 0/2/4/6 is
+            // stopped and 8/A/C/E is running.  d4 sitting still while d2 has its
+            // top bit set means only one picture is loaded.
             5'd15: begin
                 pg_hi  = {1'b0, disp_sel};
                 pg_mid = loaded_count;
-                pg_lo  = {3'b000, auto_on};
+                pg_lo  = {auto_on, sw_period1_level, sw_period0_level, 1'b0};
             end
             // Page 16 is the reader's rescue line (see the block before the frame
             // reader): d4 d3 are the state it was found in the last time it

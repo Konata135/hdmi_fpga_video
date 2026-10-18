@@ -18,6 +18,8 @@ set_pin_assignment  { rst_n }   { LOCATION = A2; IOSTANDARD = LVCMOS33; PULLTYPE
 # (KEY3 = B1 and KEY4 = C1 are free, as are SW2..SW4.)
 set_pin_assignment  { key_next } { LOCATION = B2; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
 set_pin_assignment  { sw_auto }  { LOCATION = C8; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment  { sw_period0 } { LOCATION = C7; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment  { sw_period1 } { LOCATION = C6; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
 
 # ---- HDMI ------------------------------------------------------------------
 set_pin_assignment  { HDMI_CLK_P }   { LOCATION = C3; IOSTANDARD = LVDS33; PULLTYPE = NONE; }

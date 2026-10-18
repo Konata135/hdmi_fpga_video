@@ -42,6 +42,7 @@ module tb_pic_sched;
     reg  [3:0]  load_phase = 4'd0;
     reg         key_press  = 1'b0;
     reg         auto_on    = 1'b0;
+    reg  [27:0] carou_period = CAROU;
     wire [2:0]  disp_sel;
     wire        disp_tgl;
     wire [3:0]  loaded_count;
@@ -60,8 +61,7 @@ module tb_pic_sched;
 
     mm_pic_sched #(
         .RETRY_CYCLES    (RETRY),
-        .MAX_TRIES       (TRIES),
-        .CAROUSEL_CYCLES (CAROU)
+        .MAX_TRIES       (TRIES)
     ) dut (
         .clk          (clk),
         .rst          (rst),
@@ -75,6 +75,7 @@ module tb_pic_sched;
         .load_phase   (load_phase),
         .key_press    (key_press),
         .auto_on      (auto_on),
+        .carou_period (carou_period),
         .disp_sel     (disp_sel),
         .disp_tgl     (disp_tgl),
         .loaded_count (loaded_count),
@@ -243,6 +244,35 @@ module tb_pic_sched;
             fail("something stepped with the switch off");
         else
             $display("  switch       : PASS (steps while up, still while down)");
+
+        // ---- 7. the interval selector is honoured ------------------------
+        // Four times the base interval has to take four times as long, measured
+        // between two steps: this is the SW2/SW3 selector on the board.
+        carou_period = 4 * CAROU;
+        auto_on      = 1'b1;
+        k = 0;
+        while ((disp_sel == 3'd0) && (k < 10 * CAROU)) begin
+            @(posedge clk);
+            k = k + 1;
+        end
+        if (k >= 10 * CAROU) begin
+            fail("the carousel never stepped with the long interval");
+        end else begin
+            toggles_before = toggles;
+            k = 0;
+            while ((toggles == toggles_before) && (k < 10 * CAROU)) begin
+                @(posedge clk);
+                k = k + 1;
+            end
+            if ((k < 4 * CAROU - 8) || (k > 4 * CAROU + 8)) begin
+                $display("  FAIL: the long interval took %0d clocks, expected about %0d",
+                         k, 4 * CAROU);
+                errors = errors + 1;
+            end else begin
+                $display("  interval     : PASS (%0d clocks between steps at 4x)", k);
+            end
+        end
+        auto_on = 1'b0;
 
         if (errors == 0)
             $display("RESULT: PASS -- picture scheduler verified");
