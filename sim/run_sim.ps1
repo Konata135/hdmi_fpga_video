@@ -9,6 +9,7 @@
 # ============================================================================
 param(
     [string[]] $Tb   = @('tb_m1_video', 'tb_tmds_encoder', 'tb_hdmi_tx', 'tb_seg_display',
+                         'tb_audio_tone',
                          'tb_key_debounce', 'tb_pic_sched',
                          'tb_spi_master', 'tb_sd_cmd', 'tb_sd_init',
                          'tb_sd_sec', 'tb_sd_scan', 'tb_sd_probe',
